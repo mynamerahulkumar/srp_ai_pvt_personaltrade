@@ -16,6 +16,7 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field
@@ -70,6 +71,9 @@ LIMIT_FILL_WAIT_SECONDS = 15
 MARKET_FILL_WAIT_SECONDS = 20
 GET_RETRY_ATTEMPTS = 3
 CANDLE_BUFFER = 6
+CANDLE_REFRESH_SECONDS = 60
+LOG_MAX_BYTES = 5 * 1024 * 1024
+LOG_PATH = BASE_DIR / "logs" / "bot.log"
 
 console = Console()
 log = logging.getLogger("breakout")
@@ -442,13 +446,49 @@ def load_environment() -> Environment:
 
 def setup_logging() -> None:
     """Configure concise event logging. Secrets are never logged."""
+    LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[logging.StreamHandler(sys.stdout), CappedFileHandler(LOG_PATH)],
     )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
+
+
+def _trim_log(path: Path) -> None:
+    """When the log reaches 5 MB, drop the older half and keep the newer lines."""
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return
+    if size < LOG_MAX_BYTES:
+        return
+    data = path.read_bytes()
+    keep = data[len(data) // 2 :]
+    newline = keep.find(b"\n")
+    if newline != -1:
+        keep = keep[newline + 1 :]
+    path.write_bytes(keep)
+
+
+class CappedFileHandler(logging.FileHandler):
+    """One log file. Older bytes are deleted at 5 MB. No rotated copies."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        path = Path(self.baseFilename)
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        if size >= LOG_MAX_BYTES:
+            if self.stream is not None:
+                self.stream.flush()
+                self.stream.close()
+                self.stream = None
+            _trim_log(path)
+            self.stream = self._open()
+        super().emit(record)
 
 
 def log_event(runtime: "Runtime", message: str, level: int = logging.INFO) -> None:
@@ -555,6 +595,11 @@ class Runtime:
     interrupt: bool = False
     paper_live_position_warned: bool = False
     last_announced_signal_id: str | None = None
+    completed_candles: list = field(default_factory=list)
+    last_candle_fetch_ts: float = 0.0
+    last_candle_window: int | None = None
+    candle_fetch_running: bool = False
+    candle_lock: threading.Lock = field(default_factory=threading.Lock)
 
 
 @dataclass
@@ -2117,7 +2162,7 @@ def render_dashboard(app: App) -> Panel:
     last_sig = rt.last_signal.direction if rt.last_signal else "NONE"
     foot.add_row("LAST SIGNAL", last_sig)
     foot.add_row("LAST TRADE", rt.last_trade_summary)
-    foot.add_row("NEXT POLL", f"{cfg.polling_seconds}s")
+    foot.add_row("NEXT POLL", f"{rt.next_poll_seconds}s")
     foot.add_row("API", "CONNECTED" if rt.api_ok else "ERROR")
     if rt.market_stale:
         foot.add_row("MARKET", Text("STALE — ENTRY BLOCKED", style="bold red"))
@@ -2299,14 +2344,71 @@ def scan_for_entry(app: App, last_price: float, completed: list[Candle]) -> None
     place_entry_order(app, signal, last_price)
 
 
+def _apply_candle_range(app: App, completed: list[Candle]) -> None:
+    """Store the previous-candle range. Leaves the last range in place when this fetch is short."""
+    app.runtime.completed_candles = completed
+    app.runtime.market_stale = market_data_is_stale(app, completed)
+    lookback = app.cfg.strategy.breakout_lookback_candles
+    if len(completed) < lookback or app.runtime.product is None:
+        return
+    range_high, range_low = calculate_breakout_range(completed, lookback)
+    app.runtime.range_high = range_high
+    app.runtime.range_low = range_low
+    app.runtime.long_level, app.runtime.short_level = calculate_breakout_levels(
+        range_high, range_low, app.cfg.confirmation, app.runtime.product.tick_size
+    )
+
+
+def _candle_refresh_worker(app: App) -> None:
+    """Download candles off the price loop. The last range stays up if this call fails."""
+    try:
+        candles = get_candles(app)
+        completed, _forming = split_completed_candles(candles, app.cfg.timeframe, app.cfg.tz)
+        with app.runtime.candle_lock:
+            _apply_candle_range(app, completed)
+            app.runtime.last_candle_fetch_ts = time.time()
+            app.runtime.last_candle_window = candle_window_start(time.time(), app.cfg.timeframe, app.cfg.tz)
+    except DeltaAPIError as exc:
+        app.runtime.api_ok = False
+        app.runtime.last_error = str(exc)
+        if not app.runtime.completed_candles:
+            app.runtime.market_stale = True
+        log_event(app.runtime, f"MARKET DATA FAILURE {exc}", logging.ERROR)
+    except Exception as exc:
+        app.runtime.last_error = str(exc)
+        if not app.runtime.completed_candles:
+            app.runtime.market_stale = True
+        log_event(app.runtime, f"MARKET DATA FAILURE {exc}", logging.ERROR)
+    finally:
+        app.runtime.candle_fetch_running = False
+
+
+def _schedule_candle_refresh(app: App) -> None:
+    """Start a candle fetch when the Indian-time window changes, or at least every 60 seconds."""
+    if app.runtime.candle_fetch_running:
+        return
+    now = time.time()
+    window = candle_window_start(now, app.cfg.timeframe, app.cfg.tz)
+    due = (
+        app.runtime.last_candle_fetch_ts == 0.0
+        or window != app.runtime.last_candle_window
+        or now - app.runtime.last_candle_fetch_ts >= CANDLE_REFRESH_SECONDS
+    )
+    if not due:
+        return
+    app.runtime.candle_fetch_running = True
+    threading.Thread(target=_candle_refresh_worker, args=(app,), name="candle-refresh", daemon=True).start()
+
+
 def run_poll(app: App) -> None:
     """One polling cycle. Exits always outrank new entries."""
     refresh_trading_day(app)
-    app.runtime.next_poll_seconds = app.cfg.polling_seconds
     app.runtime.entries_blocked_reason = None
 
     if check_stop_signal(app):
         shutdown_bot(app, "MANUAL STOP", close_position=False)
+
+    _schedule_candle_refresh(app)
 
     try:
         last_price, mark_price = get_current_price(app)
@@ -2337,25 +2439,6 @@ def run_poll(app: App) -> None:
         app.runtime.api_ok = False
         app.runtime.last_error = str(exc)
 
-    completed: list[Candle] = []
-    try:
-        candles = get_candles(app)
-        completed, _forming = split_completed_candles(candles, app.cfg.timeframe, app.cfg.tz)
-        app.runtime.market_stale = market_data_is_stale(app, completed)
-        lookback = app.cfg.strategy.breakout_lookback_candles
-        if len(completed) >= lookback and app.runtime.product is not None:
-            range_high, range_low = calculate_breakout_range(completed, lookback)
-            app.runtime.range_high = range_high
-            app.runtime.range_low = range_low
-            app.runtime.long_level, app.runtime.short_level = calculate_breakout_levels(
-                range_high, range_low, app.cfg.confirmation, app.runtime.product.tick_size
-            )
-    except DeltaAPIError as exc:
-        app.runtime.api_ok = False
-        app.runtime.market_stale = True
-        app.runtime.last_error = str(exc)
-        log_event(app.runtime, f"MARKET DATA FAILURE {exc}", logging.ERROR)
-
     if app.runtime.position is not None:
         manage_open_position(app, last_price, mark_price)
         return
@@ -2364,7 +2447,10 @@ def run_poll(app: App) -> None:
         log_event(app.runtime, "DAILY LOSS LIMIT REACHED — NEW TRADES BLOCKED")
         shutdown_bot(app, "DAILY LOSS LIMIT")
 
-    if app.runtime.market_stale:
+    with app.runtime.candle_lock:
+        completed = list(app.runtime.completed_candles)
+        market_stale = app.runtime.market_stale
+    if market_stale:
         app.runtime.entries_blocked_reason = "MARKET DATA STALE — ENTRY BLOCKED"
         if app.runtime.status not in {"STOPPED"}:
             app.runtime.status = "SCANNING"
@@ -2427,16 +2513,18 @@ def main() -> int:
                     runtime.api_ok = False
                     runtime.last_error = str(exc)
                     log_event(runtime, f"API ERROR {exc}", logging.ERROR)
-                live.update(render_dashboard(app))
                 elapsed = time.time() - poll_started
-                runtime.next_poll_seconds = max(0, int(cfg.polling_seconds - elapsed))
                 remain = cfg.polling_seconds - elapsed
+                runtime.next_poll_seconds = 0 if remain <= 0 else int(remain + 0.999)
+                live.update(render_dashboard(app))
                 if remain > 0:
                     deadline = time.time() + remain
                     next_draw = time.time() + 1
                     while time.time() < deadline:
                         if check_stop_signal(app):
                             break
+                        left = deadline - time.time()
+                        runtime.next_poll_seconds = 0 if left <= 0 else int(left + 0.999)
                         if time.time() >= next_draw:
                             live.update(render_dashboard(app))
                             next_draw = time.time() + 1
