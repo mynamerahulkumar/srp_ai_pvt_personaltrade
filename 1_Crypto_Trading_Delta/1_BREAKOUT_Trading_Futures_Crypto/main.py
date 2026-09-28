@@ -19,7 +19,8 @@ import sys
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import date, datetime
+from datetime import date, datetime, timezone
+from email.utils import parsedate_to_datetime
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from pathlib import Path
 from typing import Any
@@ -386,6 +387,26 @@ class Environment:
         return bool(self.api_key and self.api_secret)
 
 
+def _credential(value: str) -> str:
+    """Drop CR, spaces, and wrapping quotes so a copied .env does not change the HMAC."""
+    text = value.replace("\r", "").strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        text = text[1:-1].replace("\r", "").strip()
+    return text
+
+
+def _clock_skew_seconds(date_header: str | None) -> float | None:
+    if not date_header:
+        return None
+    try:
+        server = parsedate_to_datetime(date_header)
+    except (TypeError, ValueError, IndexError):
+        return None
+    if server.tzinfo is None:
+        server = server.replace(tzinfo=timezone.utc)
+    return abs(time.time() - server.timestamp())
+
+
 def load_environment() -> Environment:
     """Load API credentials from .env. Trading settings stay in config.yaml.
 
@@ -394,8 +415,8 @@ def load_environment() -> Environment:
     """
     load_dotenv(ENV_PATH)
     env = Environment(
-        api_key=(os.getenv("DELTA_API_KEY") or "").strip(),
-        api_secret=(os.getenv("DELTA_API_SECRET") or "").strip(),
+        api_key=_credential(os.getenv("DELTA_API_KEY") or ""),
+        api_secret=_credential(os.getenv("DELTA_API_SECRET") or ""),
     )
     if bool(env.api_key) != bool(env.api_secret):
         raise ConfigError("Set both DELTA_API_KEY and DELTA_API_SECRET, or neither.")
@@ -632,7 +653,10 @@ class DeltaClient:
                 time.sleep(0.5 * (2 ** (attempt - 1)))
                 continue
             if response.status_code >= 400:
-                raise self._extract_error(response.status_code, parsed)
+                exc = self._extract_error(response.status_code, parsed)
+                if response.status_code == 401:
+                    exc = self._explain_401(exc, response.headers.get("Date"))
+                raise exc
             if isinstance(parsed, dict) and parsed.get("success") is False:
                 raise self._extract_error(response.status_code, parsed)
             return parsed
@@ -655,6 +679,23 @@ class DeltaClient:
                 status=status,
             )
         return DeltaAPIError("HTTPError", f"HTTP {status}", status=status)
+
+    @staticmethod
+    def _explain_401(exc: DeltaAPIError, date_header: str | None) -> DeltaAPIError:
+        """Say whether a 401 is a bad clock or a secret that does not match the India key."""
+        skew = _clock_skew_seconds(date_header)
+        if skew is not None and skew > 5:
+            message = (
+                "This machine's clock differs from Delta by more than 5 seconds. "
+                "On Amazon Linux run: sudo timedatectl set-ntp true"
+            )
+        else:
+            message = (
+                "Delta India found this API key, but the secret on this machine does not match it. "
+                "Put a Delta India key pair in .env with no quotes and no spaces. "
+                "A global delta.exchange key will not sign for api.india.delta.exchange."
+            )
+        return DeltaAPIError(exc.code, message, status=401)
 
     def _mutate(self, method: str, path: str, payload: dict[str, Any]) -> Any:
         if not self.allow_mutations:
