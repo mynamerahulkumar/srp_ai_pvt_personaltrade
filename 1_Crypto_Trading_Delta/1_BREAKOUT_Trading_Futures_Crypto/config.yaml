@@ -43,7 +43,7 @@ start_time: "09:30"
 stop_time: "23:00"
 
 # If true, close this strategy's open position at stop_time
-close_positions_at_stop_time: true
+close_positions_at_stop_time: false
 
 # After the scheduled position is closed, exit Python
 stop_bot_after_close: true
@@ -104,8 +104,8 @@ stop_loss:
   value: 2
 
 # Stop after TP/SL exit
-stop_after_tp: true
-stop_after_sl: true
+stop_after_tp: false
+stop_after_sl: false
 
 # ------------------------------------------------------------
 # TRADING STYLE
