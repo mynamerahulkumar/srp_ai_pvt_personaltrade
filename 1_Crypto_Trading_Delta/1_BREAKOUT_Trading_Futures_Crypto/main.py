@@ -395,6 +395,18 @@ def _credential(value: str) -> str:
     return text
 
 
+def _public_ip() -> str | None:
+    """Best-effort public address so an IP-whitelist error names this server."""
+    try:
+        response = requests.get("https://checkip.amazonaws.com", timeout=5)
+    except requests.RequestException:
+        return None
+    text = (response.text or "").strip()
+    if response.status_code != 200 or not text or len(text) > 64 or any(ch.isspace() for ch in text):
+        return None
+    return text
+
+
 def _clock_skew_seconds(date_header: str | None) -> float | None:
     if not date_header:
         return None
@@ -682,19 +694,30 @@ class DeltaClient:
 
     @staticmethod
     def _explain_401(exc: DeltaAPIError, date_header: str | None) -> DeltaAPIError:
-        """Say whether a 401 is a bad clock or a secret that does not match the India key."""
+        """Keep Delta's 401 code and say whether it is clock, IP whitelist, or secret."""
         skew = _clock_skew_seconds(date_header)
+        code = (exc.code or "").lower().replace(" ", "").replace("_", "")
         if skew is not None and skew > 5:
             message = (
                 "This machine's clock differs from Delta by more than 5 seconds. "
                 "On Amazon Linux run: sudo timedatectl set-ntp true"
             )
-        else:
+        elif "ipnotwhitelisted" in code:
+            ip = _public_ip()
+            where = f" This server's public IP is {ip}." if ip else ""
+            message = (
+                "Delta India accepted the signature, then blocked this machine because it is not on the API key IP whitelist."
+                + where
+                + " Add that IP in the Delta India API key settings, or turn the whitelist off for this key."
+            )
+        elif "signaturemismatch" in code:
             message = (
                 "Delta India found this API key, but the secret on this machine does not match it. "
-                "Put a Delta India key pair in .env with no quotes and no spaces. "
+                "Copy both .env lines with no quotes and no spaces. "
                 "A global delta.exchange key will not sign for api.india.delta.exchange."
             )
+        else:
+            message = exc.message
         return DeltaAPIError(exc.code, message, status=401)
 
     def _mutate(self, method: str, path: str, payload: dict[str, Any]) -> Any:
