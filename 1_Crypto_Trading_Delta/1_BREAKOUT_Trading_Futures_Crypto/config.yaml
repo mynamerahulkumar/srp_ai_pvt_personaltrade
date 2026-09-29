@@ -120,17 +120,17 @@ day_trading_enabled: true
 # RISK LIMITS
 # ------------------------------------------------------------
 
-max_open_strategies: 1
+max_open_strategies: 5
 
-max_orders_per_day: 10
+max_orders_per_day: 20
 
 # If daily strategy loss reaches this amount,
 # block new entries and close active strategy position.
-max_loss_per_day_dollar: 5
+max_loss_per_day_dollar: 10
 
 # ------------------------------------------------------------
 # RE-ENTRY
 # ------------------------------------------------------------
 
 # false = do not immediately re-enter after an exit
-allow_reentry_after_exit: false
+allow_reentry_after_exit: true

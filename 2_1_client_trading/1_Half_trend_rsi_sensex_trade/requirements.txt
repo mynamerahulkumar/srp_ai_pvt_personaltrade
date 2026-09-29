@@ -1,0 +1,4 @@
+dhanhq>=2.2.0
+pandas
+PyYAML
+python-dotenv

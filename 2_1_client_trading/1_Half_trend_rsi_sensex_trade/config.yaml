@@ -1,0 +1,56 @@
+# Half Trend options bot. This file is the only trading configuration.
+# Credentials belong in .env, not here.
+
+mode:
+  trading_mode: "PAPER"          # PAPER simulates fills. LIVE sends real Dhan orders.
+
+market:
+  underlying: "SENSEX"           # SENSEX, NIFTY, or BANKNIFTY. The signal uses this index.
+  timeframe_minutes: 5           # Confirmed candle size. Dhan allows 1, 5, 15, 25, or 60.
+
+strategy:
+  amplitude: 2                   # Half Trend high/low lookback. The chart default is 2.
+  channel_deviation: 2           # Width multiplier applied to ATR/2. The chart default is 2.
+  signal_confirmation: "CANDLE_CLOSE"  # Enter only after a closed candle crosses the line.
+  exit_on_opposite_signal: true  # Close the open option on a confirmed opposite cross.
+
+option:
+  expiry_mode: "NEAREST"        # NEAREST picks the next Dhan expiry. CONFIGURED uses expiry.
+  expiry: ""                    # YYYY-MM-DD. Used only when expiry_mode is CONFIGURED.
+  strike_mode: "ATM"            # ATM, ITM, or OTM, counted in listed strikes from the chain.
+  strike_offset: 0              # Strikes away from ATM. ATM must be 0. ITM/OTM treat 0 as 1.
+  lots: 1                       # Quantity is lots times the security-master lot size.
+
+execution:
+  order_type: "LIMIT"           # LIMIT or MARKET. API MARKET orders follow Dhan's protection rule.
+  product_type: "INTRADAY"      # INTRADAY or MARGIN. Must agree with holding_mode.
+  holding_mode: "INTRADAY"      # INTRADAY can close at the session. SWING/POSITIONAL need MARGIN.
+
+risk:
+  take_profit:
+    enabled: true               # Exit when the option premium reaches the target.
+    type: "PERCENT"             # PERCENT or ABSOLUTE, measured on the option premium.
+    value: 20                   # PERCENT example: 20 means entry x 1.20. ABSOLUTE is rupees.
+  stop_loss:
+    enabled: true
+    type: "PERCENT"             # PERCENT or ABSOLUTE, measured on the option premium.
+    value: 10                   # PERCENT example: 10 means entry x 0.90.
+  max_open_strategies: 1        # This bot holds one option at a time. Keep this at 1.
+  max_orders_per_day: 10        # Cap on successful entries. Exits are still allowed after the cap.
+  max_loss_per_day_inr: 500     # Gross algo loss floor in rupees. Hitting it closes the option and stops.
+  no_reentry_after_stop_loss: true   # After a stop-loss exit the bot does not enter again.
+  no_reentry_after_max_loss: true    # After the daily loss stop the bot does not enter again.
+
+session:
+  enabled: true                 # false ignores start_time and stop_time.
+  timezone: "Asia/Kolkata"      # Clock used for the session, candles, and the trading date.
+  run_mode: "SCHEDULED"         # SCHEDULED uses the window below. CONTINUOUS does not.
+  start_time: "09:20"           # First time a new entry is allowed when run_mode is SCHEDULED.
+  stop_time: "15:20"            # After this, new entries stop. Closing follows the flags below.
+  close_all_positions_at_stop: true  # Close this algo's option at the session stop or market close.
+  stop_bot_after_close: true    # Exit the process after that handling. This flag alone does not sell.
+
+runtime:
+  polling_seconds: 5            # How often the bot checks price, P&L, and stops. Not the candle size.
+  post_close_polls: 3           # Extra reads after the exchange closes. Entries stay blocked.
+  post_close_poll_seconds: 10   # Delay between those post-close reads.
