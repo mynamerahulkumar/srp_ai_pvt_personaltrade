@@ -49,6 +49,8 @@ CONFIG_PATH = BASE_DIR / "config.yaml"
 STOP_FILE = BASE_DIR / ".bot_stop_signal"
 PID_FILE = BASE_DIR / ".bot.pid"
 SESSION_FILE = BASE_DIR / ".bot_session.json"
+STATUS_FILE = BASE_DIR / ".bot_status.json"
+DAY_FILE = BASE_DIR / ".bot_day.json"
 ENV_PATH = BASE_DIR / ".env"
 EXIT_PREVIEW_ELAPSED = 3
 SESSION_MAX_AGE_SECONDS = 120
@@ -70,7 +72,7 @@ RESOLUTION_SECONDS = {
     "1d": 86400,
 }
 PERPETUAL_TYPES = {"perpetual_futures", "perpetual_futures_v2"}
-IST_AGGREGATED_TIMEFRAMES = {"1h", "4h", "1d"}
+UTC_CANDLE_TIMEFRAMES = {"1h", "4h", "1d"}
 HIGH_LEVERAGE_WARN = 20
 MAX_CONSUMED_SIGNALS = 100
 LIMIT_FILL_WAIT_SECONDS = 15
@@ -605,6 +607,10 @@ class Runtime:
     entries_blocked_reason: str | None = None
     last_market_fetch_ts: float = 0.0
     scheduled_close_done: bool = False
+    daily_loss_announced: bool = False
+    startup_breakout_checked: bool = False
+    resume_after_candle_open: int | None = None
+    flat_orders_need_cancel: bool = False
     interrupt: bool = False
     paper_live_position_warned: bool = False
     last_announced_signal_id: str | None = None
@@ -1006,64 +1012,41 @@ def get_current_price(app: App) -> tuple[float, float]:
 
 
 def candle_window_start(ts: float, timeframe: str, tz: ZoneInfo) -> int:
-    """Floor a unix time to the candle open on the configured local clock.
+    """Floor a unix time to the Delta candle open.
 
-    5m at 21:03 IST opens at 21:00. 1h opens on the hour. 4h opens at
-    0, 4, 8, 12, 16, 20. 1d opens at local midnight.
+    1h, 4h, and 1d follow the UTC epoch. IST is UTC+5:30, so a 1-hour candle
+    is 22:30–23:30, not 22:00–23:00. A 4-hour candle opens at 01:30, 05:30,
+    09:30, 13:30, 17:30, or 21:30 IST. A daily candle opens at 05:30 IST.
+    Shorter bars already land on the same instants in UTC and IST.
     """
+    period = RESOLUTION_SECONDS[timeframe]
+    if timeframe in UTC_CANDLE_TIMEFRAMES:
+        whole = int(ts)
+        return whole - (whole % period)
     local = datetime.fromtimestamp(ts, tz=tz)
-    if timeframe == "1d":
-        start = local.replace(hour=0, minute=0, second=0, microsecond=0)
-    elif timeframe == "4h":
-        start = local.replace(hour=(local.hour // 4) * 4, minute=0, second=0, microsecond=0)
-    elif timeframe == "1h":
-        start = local.replace(minute=0, second=0, microsecond=0)
-    else:
-        period = RESOLUTION_SECONDS[timeframe] // 60
-        minutes = ((local.hour * 60 + local.minute) // period) * period
-        start = local.replace(hour=minutes // 60, minute=minutes % 60, second=0, microsecond=0)
+    minutes_per_bar = period // 60
+    minutes = ((local.hour * 60 + local.minute) // minutes_per_bar) * minutes_per_bar
+    start = local.replace(hour=minutes // 60, minute=minutes % 60, second=0, microsecond=0)
     return int(start.timestamp())
 
 
-def aggregate_candles(candles: list[Candle], timeframe: str, tz: ZoneInfo) -> list[Candle]:
-    """Fold smaller bars into local-time windows. Open is the first tick, close the last."""
-    buckets: dict[int, Candle] = {}
-    order: list[int] = []
-    for candle in candles:
-        start = candle_window_start(candle.time, timeframe, tz)
-        existing = buckets.get(start)
-        if existing is None:
-            buckets[start] = Candle(
-                time=start,
-                open=candle.open,
-                high=candle.high,
-                low=candle.low,
-                close=candle.close,
-                volume=candle.volume,
-            )
-            order.append(start)
-            continue
-        existing.high = max(existing.high, candle.high)
-        existing.low = min(existing.low, candle.low)
-        existing.close = candle.close
-        existing.volume += candle.volume
-    return [buckets[key] for key in order]
+def _candle_on_grid(ts: int, timeframe: str, tz: ZoneInfo) -> bool:
+    """True when this open is a Delta candle boundary for the timeframe."""
+    return candle_window_start(ts, timeframe, tz) == ts
 
 
 def get_candles(app: App) -> list[Candle]:
-    """Fetch the configured timeframe, or 5m bars when the timeframe must be built in IST.
+    """Fetch the configured Delta resolution. Off-grid bars are dropped.
 
-    1h, 4h, and 1d are aggregated so they open on the Indian clock, not UTC.
+    1h, 4h, and 1d come from the exchange clock, not a rebuilt Indian hour.
     """
     symbol = app.runtime.product.symbol if app.runtime.product else resolved_symbol(app.cfg)
     lookback = app.cfg.strategy.breakout_lookback_candles
     res = app.cfg.timeframe
-    aggregate = res in IST_AGGREGATED_TIMEFRAMES
-    fetch_res = "5m" if aggregate else res
     seconds = RESOLUTION_SECONDS[res]
     end = int(time.time())
     start = end - seconds * (lookback + CANDLE_BUFFER + 2)
-    raw = _unwrap(app.client.get_candles(symbol, fetch_res, start, end))
+    raw = _unwrap(app.client.get_candles(symbol, res, start, end))
     rows = raw if isinstance(raw, list) else []
     candles: list[Candle] = []
     for row in rows:
@@ -1078,12 +1061,12 @@ def get_candles(app: App) -> list[Candle]:
             continue
         if ts > 10_000_000_000:
             ts //= 1000
+        if not _candle_on_grid(ts, res, app.cfg.tz):
+            continue
         candles.append(
             Candle(time=ts, open=o, high=h, low=low, close=c, volume=_to_float(row.get("volume"), 0.0) or 0.0)
         )
     candles.sort(key=lambda item: item.time)
-    if aggregate:
-        candles = aggregate_candles(candles, res, app.cfg.tz)
     app.runtime.last_market_fetch_ts = time.time()
     return candles
 
@@ -1094,7 +1077,7 @@ def split_completed_candles(
     tz: ZoneInfo,
     now: float | None = None,
 ) -> tuple[list[Candle], Candle | None]:
-    """Separate completed candles from the bar that contains local now."""
+    """Separate completed candles from the Delta bar that contains now."""
     now = now if now is not None else time.time()
     if not candles:
         return [], None
@@ -1221,8 +1204,12 @@ def detect_breakout_signal(
     allowed = app.cfg.strategy.direction
     symbol = app.runtime.product.symbol
     tf = app.cfg.timeframe
-
-    if allowed in {"LONG", "BOTH"} and test_price > long_level:
+    long_hit = allowed in {"LONG", "BOTH"} and test_price > long_level
+    short_hit = allowed in {"SHORT", "BOTH"} and test_price < short_level
+    if long_hit and short_hit:
+        app.runtime.entries_blocked_reason = "BREAKOUT SIDES OVERLAP"
+        return None
+    if long_hit:
         return BreakoutSignal(
             direction="LONG",
             range_high=range_high,
@@ -1233,7 +1220,7 @@ def detect_breakout_signal(
             reason=f"Bullish breakout confirmed above {long_level}",
             signal_id=_signal_id(symbol, tf, "LONG", range_high, range_low, reference.time),
         )
-    if allowed in {"SHORT", "BOTH"} and test_price < short_level:
+    if short_hit:
         return BreakoutSignal(
             direction="SHORT",
             range_high=range_high,
@@ -1294,6 +1281,57 @@ def trading_day_now(cfg: Config) -> date:
     return datetime.now(tz=cfg.tz).date()
 
 
+def _write_day_ledger(app: App) -> None:
+    """Save today's IST risk counters. A failed write must not stop trading."""
+    day = app.runtime.trading_day or trading_day_now(app.cfg)
+    payload = {
+        "trading_day": day.isoformat(),
+        "daily_orders": app.runtime.daily_orders,
+        "daily_realized_pnl": app.runtime.daily_realized_pnl,
+        "scheduled_close_done": app.runtime.scheduled_close_done,
+    }
+    temporary = DAY_FILE.with_suffix(".json.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(DAY_FILE)
+    except OSError:
+        log.debug("day ledger write failed", exc_info=True)
+
+
+def _load_day_ledger(app: App) -> None:
+    """Restore today's IST loss and order count. A previous Indian day is ignored."""
+    today = trading_day_now(app.cfg)
+    app.runtime.trading_day = today
+    try:
+        raw = json.loads(DAY_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        _write_day_ledger(app)
+        return
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        _write_day_ledger(app)
+        return
+    if not isinstance(raw, dict) or raw.get("trading_day") != today.isoformat():
+        app.runtime.daily_orders = 0
+        app.runtime.daily_realized_pnl = 0.0
+        app.runtime.scheduled_close_done = False
+        app.runtime.daily_loss_announced = False
+        _write_day_ledger(app)
+        return
+    try:
+        daily_orders = int(raw.get("daily_orders", 0))
+        daily_realized = float(raw.get("daily_realized_pnl", 0.0))
+    except (TypeError, ValueError):
+        _write_day_ledger(app)
+        return
+    app.runtime.daily_orders = max(0, daily_orders)
+    app.runtime.daily_realized_pnl = daily_realized
+    app.runtime.scheduled_close_done = bool(raw.get("scheduled_close_done"))
+    log_event(
+        app.runtime,
+        f"DAY LEDGER orders={app.runtime.daily_orders} realized={app.runtime.daily_realized_pnl}",
+    )
+
+
 def refresh_trading_day(app: App) -> None:
     today = trading_day_now(app.cfg)
     if app.runtime.trading_day != today:
@@ -1301,6 +1339,9 @@ def refresh_trading_day(app: App) -> None:
         app.runtime.daily_realized_pnl = 0.0
         app.runtime.daily_orders = 0
         app.runtime.scheduled_close_done = False
+        app.runtime.daily_loss_announced = False
+        _write_day_ledger(app)
+        log_event(app.runtime, f"NEW IST TRADING DAY {today.isoformat()}")
 
 
 def daily_pnl_total(app: App, unrealized: float) -> float:
@@ -1656,6 +1697,7 @@ def paper_enter_position(app: App, signal: BreakoutSignal, price: float) -> None
         paper=True,
     )
     app.runtime.daily_orders += 1
+    _write_day_ledger(app)
     app.runtime.status = signal.direction
     app.runtime.last_trade_summary = f"PAPER {signal.direction} {app.cfg.order_size} @ {price}"
     log_event(app.runtime, f"PAPER ENTRY {signal.direction} {app.cfg.symbol} SIZE {app.cfg.order_size} ENTRY {price}")
@@ -1676,11 +1718,13 @@ def paper_exit_position(app: App, price: float, reason: str) -> float:
         return 0.0
     pnl = calculate_position_pnl(pos, price, product.contract_value)
     app.runtime.daily_realized_pnl += pnl
+    _write_day_ledger(app)
     app.runtime.last_trade_summary = f"PAPER EXIT {reason} {_money(pnl)}"
     log_event(app.runtime, f"PAPER EXIT {reason} FINAL PNL {_money(pnl)}")
     app.runtime.position = None
     app.runtime.exchange_unrealized = None
     app.runtime.status = "CLOSED"
+    _arm_next_candle(app)
     return pnl
 
 
@@ -1760,6 +1804,7 @@ def place_entry_order(app: App, signal: BreakoutSignal, last_price: float) -> No
         paper=False,
     )
     app.runtime.daily_orders += 1
+    _write_day_ledger(app)
     app.runtime.pending_client_order_id = None
     app.runtime.status = signal.direction
     app.runtime.last_trade_summary = f"LIVE {signal.direction} {app.cfg.order_size} @ {entry_price}"
@@ -1908,12 +1953,14 @@ def finalize_bracket_fill(app: App) -> None:
         exit_price = mark
     pnl = calculate_position_pnl(pos, exit_price, product.contract_value)
     app.runtime.daily_realized_pnl += pnl
+    _write_day_ledger(app)
     app.runtime.last_trade_summary = f"LIVE EXIT {reason} {_money(pnl)}"
     log_event(app.runtime, f"BRACKET FILLED {reason} FINAL REALIZED PNL {_money(pnl)}")
     app.runtime.position = None
     app.runtime.exchange_unrealized = None
     app.runtime.status = "CLOSED"
     app.runtime.exit_in_progress = False
+    _arm_next_candle(app)
     _maybe_stop_after_exit(app, reason, pnl)
 
 
@@ -1972,6 +2019,7 @@ def place_exit_order(app: App, reason: str, last_price: float) -> float | None:
         return None
     pnl = calculate_position_pnl(pos, exit_price, product.contract_value)
     app.runtime.daily_realized_pnl += pnl
+    _write_day_ledger(app)
     app.runtime.last_trade_summary = f"LIVE EXIT {reason} {_money(pnl)}"
     log_event(app.runtime, f"POSITION CLOSED {reason} FINAL REALIZED PNL {_money(pnl)}")
     app.runtime.position = None
@@ -1979,6 +2027,7 @@ def place_exit_order(app: App, reason: str, last_price: float) -> float | None:
     app.runtime.pending_client_order_id = None
     app.runtime.exit_in_progress = False
     app.runtime.status = "CLOSED"
+    _arm_next_candle(app)
     return pnl
 
 
@@ -2037,10 +2086,10 @@ def reconcile_position(app: App) -> None:
                 )
         return
 
-    if row is None:
+    if row is None or (_to_int(row.get("size"), 0) or 0) == 0:
         pos = app.runtime.position
         if pos is not None and not pos.paper and not app.runtime.exit_in_progress:
-            if pos.bracket_placed:
+            if pos.bracket_placed and row is None:
                 finalize_bracket_fill(app)
             else:
                 log_event(app.runtime, "EXCHANGE FLAT — LOCAL POSITION CLEARED")
@@ -2048,11 +2097,10 @@ def reconcile_position(app: App) -> None:
                 app.runtime.exchange_unrealized = None
                 if app.runtime.status in {"LONG", "SHORT", "ENTERING"}:
                     app.runtime.status = "SCANNING"
+                _arm_next_candle(app)
         return
 
     size = _to_int(row.get("size"), 0) or 0
-    if size == 0:
-        return
     direction = "LONG" if size > 0 else "SHORT"
     entry = _to_float(row.get("entry_price") or row.get("average_entry_price")) or app.runtime.current_price or 0.0
     app.runtime.exchange_unrealized = _exchange_unrealized(row)
@@ -2090,70 +2138,221 @@ def _mode_color(mode: str) -> str:
     return "bold red" if mode == "LIVE" else "bold green"
 
 
-def render_dashboard(app: App) -> Panel:
-    """Build the sci-fi terminal panel. Called every poll; not a log line."""
-    cfg = app.cfg
+def _price_digits(product: ProductMeta | None) -> int:
+    if product is None:
+        return 2
+    exponent = product.tick_size.as_tuple().exponent
+    if not isinstance(exponent, int):
+        return 2
+    return max(0, min(8, -exponent))
+
+
+def _snapshot_unrealized(app: App) -> float:
     rt = app.runtime
     pos = rt.position
     product = rt.product
-    current = rt.current_price
-    mark = rt.mark_price or current
-    unrealized = 0.0
-    if pos is not None and product is not None and mark is not None:
-        if rt.exchange_unrealized is not None and not pos.paper:
-            unrealized = rt.exchange_unrealized
-        else:
-            unrealized = calculate_position_pnl(pos, mark, product.contract_value)
+    mark = rt.mark_price or rt.current_price
+    if pos is None or product is None or mark is None:
+        return 0.0
+    if rt.exchange_unrealized is not None and not pos.paper:
+        return rt.exchange_unrealized
+    return calculate_position_pnl(pos, mark, product.contract_value)
 
+
+def _waiting_for(app: App, digits: int) -> str:
+    """Breakout the bot is watching, or the open position direction."""
+    rt = app.runtime
+    pos = rt.position
+    if pos is not None:
+        return f"IN {pos.direction}"
+    direction = app.cfg.strategy.direction
+    parts: list[str] = []
+    if direction in {"LONG", "BOTH"} and rt.long_level is not None:
+        parts.append(f"LONG above {_px(rt.long_level, digits)}")
+    if direction in {"SHORT", "BOTH"} and rt.short_level is not None:
+        parts.append(f"SHORT below {_px(rt.short_level, digits)}")
+    if not parts:
+        return "WAITING FOR BREAKOUT RANGE"
+    return "WAITING FOR " + " or ".join(parts)
+
+
+def _status_payload(app: App) -> dict[str, Any]:
+    """Dashboard fields for the live screen and the read-only status file.
+
+    Numbers only. API keys and order payloads are never included.
+    """
+    cfg = app.cfg
+    rt = app.runtime
+    pos = rt.position
+    current = rt.current_price
+    digits = _price_digits(rt.product)
+    unrealized = _snapshot_unrealized(app)
     tp_pnl, tp_price = calculate_take_profit(app)
     sl_pnl, sl_price = calculate_stop_loss(app)
-    digits = max(0, min(8, -int(product.tick_size.as_tuple().exponent) if product else 2))
+    last_error = rt.last_error[:500] if rt.last_error else None
+    payload: dict[str, Any] = {
+        "written_at": time.time(),
+        "pid": os.getpid(),
+        "mode": cfg.mode,
+        "symbol": cfg.symbol,
+        "timeframe": cfg.timeframe,
+        "leverage": cfg.leverage,
+        "run_mode": cfg.run_mode,
+        "direction": cfg.strategy.direction,
+        "timezone": cfg.timezone,
+        "status": rt.status,
+        "api_ok": rt.api_ok,
+        "market_stale": rt.market_stale,
+        "digits": digits,
+        "current_price": current,
+        "range_high": rt.range_high,
+        "range_low": rt.range_low,
+        "long_level": rt.long_level,
+        "short_level": rt.short_level,
+        "waiting_for": _waiting_for(app, digits),
+        "has_position": pos is not None,
+        "unrealized": unrealized,
+        "daily_pnl": daily_pnl_total(app, unrealized if pos else 0.0),
+        "daily_orders": rt.daily_orders,
+        "max_orders": cfg.max_orders_per_day,
+        "tp_pnl": tp_pnl,
+        "tp_price": tp_price,
+        "sl_pnl": sl_pnl,
+        "sl_price": sl_price,
+        "last_signal": rt.last_signal.direction if rt.last_signal else "NONE",
+        "last_trade": rt.last_trade_summary,
+        "next_poll_seconds": rt.next_poll_seconds,
+        "entries_blocked_reason": rt.entries_blocked_reason,
+        "last_error": last_error,
+        "events": [str(item) for item in rt.events],
+        "shutdown_reason": rt.shutdown_reason,
+    }
+    if pos is not None:
+        payload["position_label"] = f"{pos.direction}  SIZE {pos.quantity}"
+        payload["entry_price"] = pos.entry_price
+        payload["realized_pnl"] = pos.realized_pnl
+    return payload
 
+
+def _publish_status(app: App) -> None:
+    """Atomically replace .bot_status.json. A failed write must not stop trading."""
+    payload = _status_payload(app)
+    temporary = STATUS_FILE.with_suffix(".json.tmp")
+    try:
+        temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+        temporary.replace(STATUS_FILE)
+    except OSError:
+        log.debug("status snapshot write failed", exc_info=True)
+
+
+def _clock_from_payload(payload: dict[str, Any]) -> datetime:
+    name = str(payload.get("timezone") or "Asia/Kolkata")
+    try:
+        tz = ZoneInfo(name)
+    except Exception:
+        tz = ZoneInfo("UTC")
+    return datetime.now(tz=tz)
+
+
+def render_status_panel(payload: dict[str, Any] | None = None, *, status_check: dict[str, Any] | None = None) -> Panel:
+    """Same breakout panel as the live bot.
+
+    status_check is set only by status.py. It adds RUNNING/CLOSED and a
+    countdown. It does not change trading state.
+    """
     header = Table.grid(expand=True)
     header.add_column(justify="center")
-    title = Text("◈ DELTA // BREAKOUT CORE ◈", style="bold cyan")
-    header.add_row(title)
-    if cfg.mode == "LIVE":
+    header.add_row(Text("◈ DELTA // BREAKOUT CORE ◈", style="bold cyan"))
+
+    if not payload:
+        running = bool(status_check and status_check.get("running"))
+        pid = status_check.get("pid") if status_check else None
+        seconds_left = int(status_check.get("seconds_left", 0)) if status_check else 0
+        if running:
+            header.add_row(Text(f"PROCESS RUNNING  pid {pid}", style="bold green"))
+            message = "No status snapshot yet.\nRestart the bot once so this screen can show PnL and breakout levels."
+        else:
+            header.add_row(Text("PROCESS CLOSED", style="bold yellow"))
+            message = "No bot process is running."
+        if status_check is not None:
+            header.add_row(Text(f"closes in {seconds_left}s", style="dim"))
+        body = Group(Align.center(header), Text(""), Text(message))
+        subtitle = "read-only status — does not stop the bot" if status_check is not None else "stop.py does not close positions"
+        return Panel(body, border_style="yellow", title="DELTA INDIA  •  PERPETUAL FUTURES", subtitle=subtitle)
+
+    mode = str(payload.get("mode") or "PAPER")
+    try:
+        leverage = int(payload.get("leverage") or 0)
+    except (TypeError, ValueError):
+        leverage = 0
+    try:
+        digits = int(payload.get("digits"))
+    except (TypeError, ValueError):
+        digits = 2
+    digits = max(0, min(8, digits))
+    current = _to_float(payload.get("current_price"))
+    if mode == "LIVE":
         header.add_row(Text("⚠ LIVE TRADING ENABLED", style="bold red"))
-    if cfg.leverage >= HIGH_LEVERAGE_WARN:
-        header.add_row(Text(f"⚠ LEVERAGE: {cfg.leverage}X", style="bold yellow"))
+    if leverage >= HIGH_LEVERAGE_WARN:
+        header.add_row(Text(f"⚠ LEVERAGE: {leverage}X", style="bold yellow"))
 
     sys_table = Table.grid(expand=True, padding=(0, 2))
     sys_table.add_column(style="dim", width=14)
-    sys_table.add_column(width=16)
+    sys_table.add_column(width=22)
     sys_table.add_column(style="dim", width=14)
     sys_table.add_column()
-    sys_table.add_row("SYSTEM", "ONLINE" if rt.api_ok else "DEGRADED", "MODE", Text(cfg.mode, style=_mode_color(cfg.mode)))
-    sys_table.add_row("SYMBOL", cfg.symbol, "TF", cfg.timeframe)
-    now_local = datetime.now(tz=cfg.tz)
+    if status_check is not None:
+        if status_check.get("running"):
+            process = Text(f"RUNNING  pid {status_check.get('pid')}", style="bold green")
+        else:
+            process = Text("CLOSED", style="bold yellow")
+        seconds_left = int(status_check.get("seconds_left", 0))
+        sys_table.add_row("PROCESS", process, "CHECK", Text(f"closes in {seconds_left}s", style="dim"))
+        if status_check.get("stale"):
+            age = status_check.get("age_seconds")
+            age_text = f"{int(age)}s ago" if isinstance(age, (int, float)) else "OLD"
+            sys_table.add_row("SNAPSHOT", Text("STALE", style="bold yellow"), "AGE", age_text)
+        elif status_check.get("missing"):
+            sys_table.add_row("SNAPSHOT", Text("NOT PUBLISHED YET", style="bold yellow"), "", "")
+    api_ok = bool(payload.get("api_ok"))
+    sys_table.add_row("SYSTEM", "ONLINE" if api_ok else "DEGRADED", "MODE", Text(mode, style=_mode_color(mode)))
+    sys_table.add_row("SYMBOL", str(payload.get("symbol") or "—"), "TF", str(payload.get("timeframe") or "—"))
+    now_local = _clock_from_payload(payload)
     sys_table.add_row("TIME", now_local.strftime("%d %b %Y  %H:%M:%S IST"), "", "")
-    sys_table.add_row("LEVERAGE", f"{cfg.leverage}X", "STATE", rt.status)
-    sys_table.add_row("RUN", cfg.run_mode, "DIR", cfg.strategy.direction)
+    sys_table.add_row("LEVERAGE", f"{leverage}X", "STATE", str(payload.get("status") or "—"))
+    sys_table.add_row("RUN", str(payload.get("run_mode") or "—"), "DIR", str(payload.get("direction") or "—"))
 
     mkt = Table.grid(expand=True, padding=(0, 2))
     mkt.add_column(style="dim", width=22)
     mkt.add_column()
     mkt.add_row("CURRENT PRICE", _px(current, digits))
-    mkt.add_row("RANGE HIGH", _px(rt.range_high, digits))
-    mkt.add_row("RANGE LOW", _px(rt.range_low, digits))
-    mkt.add_row("BREAKOUT LONG", _px(rt.long_level, digits))
-    mkt.add_row("BREAKOUT SHORT", _px(rt.short_level, digits))
+    mkt.add_row("RANGE HIGH", _px(_to_float(payload.get("range_high")), digits))
+    mkt.add_row("RANGE LOW", _px(_to_float(payload.get("range_low")), digits))
+    mkt.add_row("BREAKOUT LONG", _px(_to_float(payload.get("long_level")), digits))
+    mkt.add_row("BREAKOUT SHORT", _px(_to_float(payload.get("short_level")), digits))
+    mkt.add_row("BREAKOUT", str(payload.get("waiting_for") or "WAITING FOR BREAKOUT RANGE"))
 
+    unrealized = _to_float(payload.get("unrealized"), 0.0) or 0.0
+    tp_pnl = _to_float(payload.get("tp_pnl"))
+    tp_price = _to_float(payload.get("tp_price"))
+    sl_pnl = _to_float(payload.get("sl_pnl"))
+    sl_price = _to_float(payload.get("sl_price"))
     pos_table = Table.grid(expand=True, padding=(0, 2))
     pos_table.add_column(style="dim", width=22)
     pos_table.add_column()
-    if pos is None:
+    if not payload.get("has_position"):
         pos_table.add_row("POSITION", "NONE")
         pos_table.add_row("CURRENT PNL", _money(0.0))
         pos_table.add_row("TP TARGET", _money(tp_pnl) if tp_pnl is not None else _px(tp_price, digits))
         pos_table.add_row("SL TARGET", _money(-sl_pnl) if sl_pnl is not None else _px(sl_price, digits))
     else:
-        pos_table.add_row("POSITION", f"{pos.direction}  SIZE {pos.quantity}")
+        pos_table.add_row("POSITION", str(payload.get("position_label") or "OPEN"))
         pos_table.add_row("CURRENT PNL", _money(unrealized, 4))
-        pos_table.add_row("ENTRY PRICE", _px(pos.entry_price, digits))
+        pos_table.add_row("ENTRY PRICE", _px(_to_float(payload.get("entry_price")), digits))
         pos_table.add_row("CURRENT PRICE", _px(current, digits))
-        pos_table.add_row("REALIZED PNL", _money(pos.realized_pnl))
-        pos_table.add_row("TOTAL STRATEGY PNL", _money(unrealized + pos.realized_pnl))
+        realized = _to_float(payload.get("realized_pnl"), 0.0) or 0.0
+        pos_table.add_row("REALIZED PNL", _money(realized))
+        pos_table.add_row("TOTAL STRATEGY PNL", _money(unrealized + realized))
         if tp_price is not None:
             pos_table.add_row("TP PRICE", _px(tp_price, digits))
             if current is not None:
@@ -2166,25 +2365,31 @@ def render_dashboard(app: App) -> Panel:
                 pos_table.add_row("DISTANCE TO SL", _px(abs(sl_price - current), digits))
         else:
             pos_table.add_row("SL TARGET", _money(-sl_pnl) if sl_pnl is not None else "—")
-    pos_table.add_row("DAILY PNL", _money(daily_pnl_total(app, unrealized if pos else 0.0)))
-    pos_table.add_row("DAILY ORDERS", f"{rt.daily_orders}/{cfg.max_orders_per_day}")
+    pos_table.add_row("DAILY PNL", _money(_to_float(payload.get("daily_pnl"), 0.0)))
+    pos_table.add_row("DAILY ORDERS", f"{payload.get('daily_orders', 0)}/{payload.get('max_orders', 0)}")
 
     foot = Table.grid(expand=True, padding=(0, 2))
     foot.add_column(style="dim", width=22)
     foot.add_column()
-    last_sig = rt.last_signal.direction if rt.last_signal else "NONE"
-    foot.add_row("LAST SIGNAL", last_sig)
-    foot.add_row("LAST TRADE", rt.last_trade_summary)
-    foot.add_row("NEXT POLL", f"{rt.next_poll_seconds}s")
-    foot.add_row("API", "CONNECTED" if rt.api_ok else "ERROR")
-    if rt.market_stale:
+    foot.add_row("LAST SIGNAL", str(payload.get("last_signal") or "NONE"))
+    foot.add_row("LAST TRADE", str(payload.get("last_trade") or "NONE"))
+    foot.add_row("NEXT POLL", f"{payload.get('next_poll_seconds', 0)}s")
+    foot.add_row("API", "CONNECTED" if api_ok else "ERROR")
+    if payload.get("market_stale"):
         foot.add_row("MARKET", Text("STALE — ENTRY BLOCKED", style="bold red"))
-    if rt.entries_blocked_reason:
-        foot.add_row("ENTRY GATE", rt.entries_blocked_reason)
-    if rt.last_error:
-        foot.add_row("LAST ERROR", rt.last_error[:80])
+    if payload.get("entries_blocked_reason"):
+        foot.add_row("ENTRY GATE", str(payload.get("entries_blocked_reason")))
+    if payload.get("shutdown_reason"):
+        foot.add_row("STOP REASON", str(payload.get("shutdown_reason"))[:80])
+    if payload.get("last_error"):
+        foot.add_row("LAST ERROR", str(payload.get("last_error"))[:80])
 
-    events = Text("\n".join(rt.events) or "waiting…", style="dim")
+    events_raw = payload.get("events")
+    if isinstance(events_raw, list):
+        event_lines = [str(item) for item in events_raw if str(item).strip()]
+    else:
+        event_lines = []
+    events = Text("\n".join(event_lines) or "waiting…", style="dim")
     body = Group(
         Align.center(header),
         sys_table,
@@ -2198,8 +2403,24 @@ def render_dashboard(app: App) -> Panel:
         Text("EVENTS", style="bold cyan"),
         events,
     )
-    border = "red" if cfg.mode == "LIVE" else "cyan"
-    return Panel(body, border_style=border, title="DELTA INDIA  •  PERPETUAL FUTURES", subtitle="stop.py does not close positions")
+    if status_check is not None:
+        subtitle = "read-only status — does not stop the bot"
+    else:
+        subtitle = "stop.py does not close positions"
+    border = "red" if mode == "LIVE" else "cyan"
+    return Panel(body, border_style=border, title="DELTA INDIA  •  PERPETUAL FUTURES", subtitle=subtitle)
+
+
+def render_dashboard(app: App) -> Panel:
+    """Build the sci-fi terminal panel. Called every poll; not a log line."""
+    return render_status_panel(_status_payload(app))
+
+
+def _refresh_outputs(app: App, live: Live | None) -> None:
+    """Publish the status file and redraw the live screen when one is attached."""
+    _publish_status(app)
+    if live is not None:
+        live.update(render_dashboard(app))
 
 
 # ---------------------------------------------------------------------------
@@ -2417,6 +2638,7 @@ def _load_session_snapshot(app: App) -> None:
     if isinstance(candle_ts, int):
         app.runtime.last_processed_candle_ts = candle_ts
     _discard_session_snapshot()
+    _write_day_ledger(app)
     log_event(
         app.runtime,
         f"SESSION RESTORED orders={app.runtime.daily_orders} realized={app.runtime.daily_realized_pnl}",
@@ -2443,8 +2665,19 @@ def _maybe_stop_after_exit(app: App, reason: str, pnl: float | None) -> None:
         shutdown_bot(app, "TP EXIT COMPLETE")
     if reason == "SL" and app.cfg.stop_after_sl:
         shutdown_bot(app, "SL EXIT COMPLETE")
-    if reason in {"DAILY LOSS", "SCHEDULED CLOSE"}:
+    if reason == "SCHEDULED CLOSE":
         shutdown_bot(app, f"{reason} COMPLETE")
+
+
+def _block_for_daily_loss(app: App) -> None:
+    """Close is the caller's job. New entries stay blocked until the next IST midnight."""
+    app.runtime.entries_blocked_reason = "DAILY LOSS LIMIT REACHED"
+    if app.runtime.status not in {"STOPPED"}:
+        app.runtime.status = "SCANNING"
+    if app.runtime.daily_loss_announced:
+        return
+    app.runtime.daily_loss_announced = True
+    log_event(app.runtime, "DAILY LOSS LIMIT REACHED — NEW TRADES BLOCKED")
 
 
 def _exchange_unrealized(row: dict[str, Any] | None) -> float | None:
@@ -2473,9 +2706,8 @@ def manage_open_position(app: App, last_price: float, mark_price: float) -> None
 
     day_total = daily_pnl_total(app, unrealized)
     if day_total <= -app.cfg.max_loss_per_day_dollar:
-        log_event(app.runtime, "DAILY LOSS LIMIT REACHED — NEW TRADES BLOCKED")
-        pnl = close_strategy_position(app, "DAILY LOSS", last_price)
-        _maybe_stop_after_exit(app, "DAILY LOSS", pnl)
+        _block_for_daily_loss(app)
+        close_strategy_position(app, "DAILY LOSS", last_price)
         return
 
     if not pos.bracket_placed and check_take_profit(app, unrealized, mark_price):
@@ -2492,14 +2724,71 @@ def manage_open_position(app: App, last_price: float, mark_price: float) -> None
         pnl = close_strategy_position(app, "SCHEDULED CLOSE", last_price)
         if app.runtime.position is None:
             app.runtime.scheduled_close_done = True
+            _write_day_ledger(app)
             if app.cfg.stop_bot_after_close:
                 _maybe_stop_after_exit(app, "SCHEDULED CLOSE", pnl if pnl is not None else 0.0)
         return
 
 
+def _arm_next_candle(app: App) -> None:
+    """After a flat exit, block entries until the next Delta candle opens."""
+    window = candle_window_start(time.time(), app.cfg.timeframe, app.cfg.tz)
+    if app.runtime.resume_after_candle_open == window:
+        _cancel_flat_orders(app)
+        return
+    app.runtime.resume_after_candle_open = window
+    app.runtime.flat_orders_need_cancel = app.cfg.mode == "LIVE"
+    app.runtime.entries_blocked_reason = "WAITING FOR NEXT CANDLE"
+    log_event(app.runtime, "POSITION FLAT — WAITING FOR NEXT CANDLE")
+    _cancel_flat_orders(app)
+
+
+def _cancel_flat_orders(app: App) -> None:
+    """Drop leftover TP/SL orders once the position size is zero."""
+    if not app.runtime.flat_orders_need_cancel or app.cfg.mode != "LIVE":
+        app.runtime.flat_orders_need_cancel = False
+        return
+    cancel_product_orders(app)
+    try:
+        remaining = get_open_orders(app)
+    except DeltaAPIError:
+        return
+    if not remaining:
+        app.runtime.flat_orders_need_cancel = False
+
+
+def _waiting_for_next_candle(app: App) -> bool:
+    """True until the Delta candle after the exit candle has opened."""
+    gate = app.runtime.resume_after_candle_open
+    if gate is None:
+        return False
+    window = candle_window_start(time.time(), app.cfg.timeframe, app.cfg.tz)
+    if window <= gate:
+        return True
+    app.runtime.resume_after_candle_open = None
+    return False
+
+
+def _breakout_ready(app: App, completed: list[Candle], live_price: float | None) -> bool:
+    """True when this poll can judge a breakout, not merely wait for candles."""
+    lookback = app.cfg.strategy.breakout_lookback_candles
+    needed = lookback + (1 if app.cfg.confirmation.candle_close_confirmation else 0)
+    if app.runtime.product is None or len(completed) < needed:
+        return False
+    if not app.cfg.confirmation.candle_close_confirmation and live_price is None:
+        return False
+    return True
+
+
 def scan_for_entry(app: App, last_price: float, completed: list[Candle]) -> None:
     """Evaluate a new breakout only when no strategy position is active."""
     if app.runtime.position is not None:
+        return
+    _cancel_flat_orders(app)
+    if _waiting_for_next_candle(app):
+        app.runtime.entries_blocked_reason = "WAITING FOR NEXT CANDLE"
+        if app.runtime.status not in {"WAITING", "STOPPED"}:
+            app.runtime.status = "SCANNING"
         return
     if not app.cfg.confirmation.candle_close_confirmation and completed:
         app.runtime.last_processed_candle_ts = completed[-1].time
@@ -2507,6 +2796,18 @@ def scan_for_entry(app: App, last_price: float, completed: list[Candle]) -> None
     signal = detect_breakout_signal(app, completed, last_price)
     if app.cfg.confirmation.candle_close_confirmation and completed:
         app.runtime.last_processed_candle_ts = completed[-1].time
+
+    if not app.runtime.startup_breakout_checked and _breakout_ready(app, completed, last_price):
+        app.runtime.startup_breakout_checked = True
+        if signal is not None:
+            mark_signal_consumed(app, signal)
+            app.runtime.entries_blocked_reason = "STARTUP BREAKOUT IGNORED"
+            app.runtime.status = "SCANNING"
+            log_event(
+                app.runtime,
+                f"STARTUP BREAKOUT IGNORED {signal.direction} level={signal.breakout_level}",
+            )
+            return
 
     if signal is None:
         if app.runtime.status not in {"WAITING", "SCANNING", "STOPPED"}:
@@ -2642,8 +2943,8 @@ def run_poll(app: App) -> None:
         return
 
     if daily_pnl_total(app, 0.0) <= -app.cfg.max_loss_per_day_dollar:
-        log_event(app.runtime, "DAILY LOSS LIMIT REACHED — NEW TRADES BLOCKED")
-        shutdown_bot(app, "DAILY LOSS LIMIT")
+        _block_for_daily_loss(app)
+        return
 
     with app.runtime.candle_lock:
         completed = list(app.runtime.completed_candles)
@@ -2669,8 +2970,7 @@ def _service_loop(app: App, live: Live | None, preview_deadline: float | None) -
             try:
                 shutdown_bot(app, "MANUAL STOP", close_position=False)
             except HaltBot:
-                if live is not None:
-                    live.update(render_dashboard(app))
+                _refresh_outputs(app, live)
                 return False
         if preview_deadline is not None and time.time() >= preview_deadline:
             log_event(runtime, "PREVIEW WINDOW ENDED")
@@ -2680,8 +2980,7 @@ def _service_loop(app: App, live: Live | None, preview_deadline: float | None) -
         try:
             run_poll(app)
         except HaltBot:
-            if live is not None:
-                live.update(render_dashboard(app))
+            _refresh_outputs(app, live)
             return False
         except DeltaAPIError as exc:
             runtime.api_ok = False
@@ -2690,8 +2989,7 @@ def _service_loop(app: App, live: Live | None, preview_deadline: float | None) -
         elapsed = time.time() - poll_started
         remain = cfg.polling_seconds - elapsed
         runtime.next_poll_seconds = 0 if remain <= 0 else int(remain + 0.999)
-        if live is not None:
-            live.update(render_dashboard(app))
+        _refresh_outputs(app, live)
         if remain > 0:
             deadline = time.time() + remain
             next_draw = time.time() + 1
@@ -2703,16 +3001,15 @@ def _service_loop(app: App, live: Live | None, preview_deadline: float | None) -
                     return True
                 left = deadline - time.time()
                 runtime.next_poll_seconds = 0 if left <= 0 else int(left + 0.999)
-                if live is not None and time.time() >= next_draw:
-                    live.update(render_dashboard(app))
+                if time.time() >= next_draw:
+                    _refresh_outputs(app, live)
                     next_draw = time.time() + 1
                 time.sleep(min(0.25, max(0.0, deadline - time.time())))
         if check_stop_signal(app):
             try:
                 shutdown_bot(app, "MANUAL STOP", close_position=False)
             except HaltBot:
-                if live is not None:
-                    live.update(render_dashboard(app))
+                _refresh_outputs(app, live)
                 return False
         if preview_deadline is not None and time.time() >= preview_deadline:
             log_event(runtime, "PREVIEW WINDOW ENDED")
@@ -2744,6 +3041,7 @@ def main(preview_seconds: float | None = None, headless: bool = False) -> int:
 
     runtime: Runtime | None = None
     client: DeltaClient | None = None
+    app: App | None = None
     handoff = False
     try:
         started_at = datetime.now(tz=cfg.tz)
@@ -2781,8 +3079,10 @@ def main(preview_seconds: float | None = None, headless: bool = False) -> int:
             apply_leverage(app)
             runtime.status = "SCANNING"
             reconcile_position(app)
+            _load_day_ledger(app)
             _load_session_snapshot(app)
             log_event(runtime, f"BOT READY pid={os.getpid()}")
+            _publish_status(app)
         except (ConfigError, DeltaAPIError) as exc:
             console.print(f"[red]STARTUP FAILED:[/red] {exc}")
             log.error("STARTUP FAILED: %s", exc)
@@ -2806,6 +3106,9 @@ def main(preview_seconds: float | None = None, headless: bool = False) -> int:
             if runtime.position is not None:
                 log_event(runtime, "EXISTING POSITION REMAINS OPEN")
     finally:
+        if app is not None and not handoff:
+            app.runtime.status = "STOPPED"
+            _publish_status(app)
         if client is not None:
             client.close()
         _release_pid_lock()

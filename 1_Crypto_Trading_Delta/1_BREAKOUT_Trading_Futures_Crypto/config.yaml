@@ -120,7 +120,7 @@ day_trading_enabled: true
 # RISK LIMITS
 # ------------------------------------------------------------
 
-max_open_strategies: 5
+max_open_strategies: 1
 
 max_orders_per_day: 20
 
