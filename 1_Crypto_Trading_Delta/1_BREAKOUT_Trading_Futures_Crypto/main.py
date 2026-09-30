@@ -9,12 +9,14 @@ This module does not import anything from docs/.
 
 from __future__ import annotations
 
+import argparse
 import hashlib
 import hmac
 import json
 import logging
 import os
 import signal
+import subprocess
 import sys
 import threading
 import time
@@ -45,7 +47,11 @@ from rich.text import Text
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yaml"
 STOP_FILE = BASE_DIR / ".bot_stop_signal"
+PID_FILE = BASE_DIR / ".bot.pid"
+SESSION_FILE = BASE_DIR / ".bot_session.json"
 ENV_PATH = BASE_DIR / ".env"
+EXIT_PREVIEW_ELAPSED = 3
+SESSION_MAX_AGE_SECONDS = 120
 
 INDIA_PROD_REST = "https://api.india.delta.exchange/v2"
 USER_AGENT = "DeltaBreakoutBot/1.0"
@@ -444,14 +450,21 @@ def load_environment() -> Environment:
 # ---------------------------------------------------------------------------
 
 
-def setup_logging() -> None:
-    """Configure concise event logging. Secrets are never logged."""
+def setup_logging(*, headless: bool = False) -> None:
+    """Configure concise event logging. Secrets are never logged.
+
+    Headless mode writes only to the capped bot.log. A second stream would
+    grow without a limit when stdout is a file on a small VM disk.
+    """
     LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    handlers: list[logging.Handler] = [CappedFileHandler(LOG_PATH)]
+    if not headless:
+        handlers.insert(0, logging.StreamHandler(sys.stdout))
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout), CappedFileHandler(LOG_PATH)],
+        handlers=handlers,
     )
     logging.getLogger("urllib3").setLevel(logging.WARNING)
 
@@ -2217,12 +2230,197 @@ def _install_signal_handlers(app: App) -> None:
     signal.signal(signal.SIGTERM, _handle)
 
 
-def _clear_stale_stop_file() -> None:
-    if STOP_FILE.exists():
+def _clear_stale_stop_file(started_at: datetime) -> None:
+    """Remove a stop file left by an earlier run.
+
+    A file written at or after this process start is a real stop request.
+    The headless handoff sets started_at to the moment the launcher checked,
+    so a stop.py during that gap is kept and does not close positions.
+    """
+    if not STOP_FILE.exists():
+        return
+    try:
+        mtime = STOP_FILE.stat().st_mtime
+    except OSError:
+        return
+    if mtime >= started_at.timestamp() - 1:
+        return
+    try:
+        STOP_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _read_bot_pid() -> int | None:
+    try:
+        text = PID_FILE.read_text(encoding="utf-8").strip()
+    except OSError:
+        return None
+    try:
+        pid = int(text)
+    except ValueError:
+        return None
+    if pid <= 0:
+        return None
+    return pid
+
+
+def _pid_is_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except OSError:
+        return False
+    return True
+
+
+def _process_command(pid: int) -> str | None:
+    """Command line for pid. None when it cannot be read."""
+    if sys.platform.startswith("linux"):
         try:
-            STOP_FILE.unlink()
+            raw = Path(f"/proc/{pid}/cmdline").read_bytes()
         except OSError:
-            pass
+            return None
+        return raw.replace(b"\x00", b" ").decode("utf-8", errors="replace").strip()
+    try:
+        result = subprocess.run(
+            ["ps", "-p", str(pid), "-o", "command="],
+            capture_output=True,
+            text=True,
+            timeout=2,
+            check=False,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    return result.stdout.strip() or None
+
+
+def _process_is_bot(pid: int) -> bool:
+    """True when pid is alive and its command line is this bot."""
+    if not _pid_is_alive(pid):
+        return False
+    command = _process_command(pid)
+    if not command:
+        return False
+    return "main.py" in command
+
+
+def running_bot_pid() -> int | None:
+    """Pid of another live bot, when .bot.pid still points at main.py."""
+    pid = _read_bot_pid()
+    if pid is None or pid == os.getpid():
+        return None
+    if _process_is_bot(pid):
+        return pid
+    return None
+
+
+def write_bot_pid(pid: int) -> None:
+    PID_FILE.write_text(f"{pid}\n", encoding="utf-8")
+
+
+def _acquire_pid_lock() -> int | None:
+    """Record this process. Return the other pid when a live bot already holds the lock."""
+    other = running_bot_pid()
+    if other is not None:
+        return other
+    write_bot_pid(os.getpid())
+    return running_bot_pid()
+
+
+def clear_bot_pid(pid: int) -> None:
+    """Remove .bot.pid when it still names this pid."""
+    if _read_bot_pid() != pid:
+        return
+    try:
+        PID_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _release_pid_lock() -> None:
+    clear_bot_pid(os.getpid())
+
+
+def _write_session_snapshot(runtime: Runtime, cfg: Config) -> None:
+    """Save in-memory risk counters so the detached process keeps the same day."""
+    day = runtime.trading_day or trading_day_now(cfg)
+    payload = {
+        "written_at": time.time(),
+        "trading_day": day.isoformat(),
+        "daily_orders": runtime.daily_orders,
+        "daily_realized_pnl": runtime.daily_realized_pnl,
+        "scheduled_close_done": runtime.scheduled_close_done,
+        "consumed_signal_ids": list(runtime.consumed_signal_ids),
+        "last_processed_candle_ts": runtime.last_processed_candle_ts,
+    }
+    temporary = SESSION_FILE.with_suffix(".json.tmp")
+    temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
+    temporary.replace(SESSION_FILE)
+
+
+def _discard_session_snapshot() -> None:
+    try:
+        SESSION_FILE.unlink()
+    except OSError:
+        pass
+
+
+def _load_session_snapshot(app: App) -> None:
+    """Restore today's risk counters from a fresh handoff file, then delete it.
+
+    The open position is not in this file. reconcile_position owns that.
+    """
+    try:
+        raw = json.loads(SESSION_FILE.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return
+    except (OSError, json.JSONDecodeError, UnicodeError):
+        _discard_session_snapshot()
+        return
+    if not isinstance(raw, dict):
+        _discard_session_snapshot()
+        return
+    try:
+        written_at = float(raw.get("written_at"))
+    except (TypeError, ValueError):
+        _discard_session_snapshot()
+        return
+    if time.time() - written_at > SESSION_MAX_AGE_SECONDS:
+        _discard_session_snapshot()
+        return
+    today = trading_day_now(app.cfg).isoformat()
+    if raw.get("trading_day") != today:
+        _discard_session_snapshot()
+        return
+    try:
+        daily_orders = int(raw.get("daily_orders", 0))
+        daily_realized = float(raw.get("daily_realized_pnl", 0.0))
+    except (TypeError, ValueError):
+        _discard_session_snapshot()
+        return
+    app.runtime.trading_day = trading_day_now(app.cfg)
+    app.runtime.daily_orders = max(0, daily_orders)
+    app.runtime.daily_realized_pnl = daily_realized
+    app.runtime.scheduled_close_done = bool(raw.get("scheduled_close_done"))
+    signal_ids = raw.get("consumed_signal_ids")
+    if isinstance(signal_ids, list):
+        for signal_id in signal_ids[-MAX_CONSUMED_SIGNALS:]:
+            if isinstance(signal_id, str) and signal_id not in app.runtime.consumed_signal_ids:
+                app.runtime.consumed_signal_ids.append(signal_id)
+    candle_ts = raw.get("last_processed_candle_ts")
+    if isinstance(candle_ts, int):
+        app.runtime.last_processed_candle_ts = candle_ts
+    _discard_session_snapshot()
+    log_event(
+        app.runtime,
+        f"SESSION RESTORED orders={app.runtime.daily_orders} realized={app.runtime.daily_realized_pnl}",
+    )
 
 
 def interruptible_sleep(app: App) -> None:
@@ -2458,95 +2656,174 @@ def run_poll(app: App) -> None:
     scan_for_entry(app, last_price, completed)
 
 
-def main() -> int:
-    """Process entry. Loads config, validates the product, then polls."""
-    setup_logging()
+def _service_loop(app: App, live: Live | None, preview_deadline: float | None) -> bool:
+    """Poll until stop or the preview deadline.
+
+    True means the preview window ended and the caller should detach.
+    A manual stop or strategy halt returns False and does not flatten.
+    """
+    cfg = app.cfg
+    runtime = app.runtime
+    while True:
+        if check_stop_signal(app):
+            try:
+                shutdown_bot(app, "MANUAL STOP", close_position=False)
+            except HaltBot:
+                if live is not None:
+                    live.update(render_dashboard(app))
+                return False
+        if preview_deadline is not None and time.time() >= preview_deadline:
+            log_event(runtime, "PREVIEW WINDOW ENDED")
+            return True
+
+        poll_started = time.time()
+        try:
+            run_poll(app)
+        except HaltBot:
+            if live is not None:
+                live.update(render_dashboard(app))
+            return False
+        except DeltaAPIError as exc:
+            runtime.api_ok = False
+            runtime.last_error = str(exc)
+            log_event(runtime, f"API ERROR {exc}", logging.ERROR)
+        elapsed = time.time() - poll_started
+        remain = cfg.polling_seconds - elapsed
+        runtime.next_poll_seconds = 0 if remain <= 0 else int(remain + 0.999)
+        if live is not None:
+            live.update(render_dashboard(app))
+        if remain > 0:
+            deadline = time.time() + remain
+            next_draw = time.time() + 1
+            while time.time() < deadline:
+                if check_stop_signal(app):
+                    break
+                if preview_deadline is not None and time.time() >= preview_deadline:
+                    log_event(runtime, "PREVIEW WINDOW ENDED")
+                    return True
+                left = deadline - time.time()
+                runtime.next_poll_seconds = 0 if left <= 0 else int(left + 0.999)
+                if live is not None and time.time() >= next_draw:
+                    live.update(render_dashboard(app))
+                    next_draw = time.time() + 1
+                time.sleep(min(0.25, max(0.0, deadline - time.time())))
+        if check_stop_signal(app):
+            try:
+                shutdown_bot(app, "MANUAL STOP", close_position=False)
+            except HaltBot:
+                if live is not None:
+                    live.update(render_dashboard(app))
+                return False
+        if preview_deadline is not None and time.time() >= preview_deadline:
+            log_event(runtime, "PREVIEW WINDOW ENDED")
+            return True
+
+
+def main(preview_seconds: float | None = None, headless: bool = False) -> int:
+    """Process entry. Loads config, validates the product, then polls.
+
+    preview_seconds shows the dashboard for that long, then returns
+    EXIT_PREVIEW_ELAPSED without closing a position. headless keeps the
+    same poll loop with no Rich screen.
+    """
+    setup_logging(headless=headless)
     try:
         cfg = load_config()
         env = load_environment()
     except ConfigError as exc:
         console.print(f"[red]CONFIG ERROR:[/red] {exc}")
+        log.error("CONFIG ERROR: %s", exc)
         return 2
 
-    runtime = Runtime(status="STARTING", next_poll_seconds=cfg.polling_seconds, started_at=datetime.now(tz=cfg.tz))
-    client = create_delta_client(cfg, env)
-    app = App(cfg=cfg, env=env, client=client, runtime=runtime)
-    _install_signal_handlers(app)
-    _clear_stale_stop_file()
+    other = _acquire_pid_lock()
+    if other is not None:
+        console.print(f"[yellow]Bot is already running (pid {other}).[/yellow]")
+        console.print("Stop it with: python stop.py")
+        log.error("Bot is already running (pid %s).", other)
+        return 1
 
-    log_event(runtime, "BOT STARTED")
-    log_event(runtime, f"MODE {cfg.mode}")
-    log_event(runtime, f"SYMBOL {cfg.symbol} TIMEFRAME {cfg.timeframe} LEVERAGE {cfg.leverage}X")
-    if cfg.mode == "LIVE":
-        log_event(runtime, "⚠ LIVE TRADING ENABLED — REAL MONEY AT RISK")
-        runtime.live_warning_shown = False
-    if cfg.leverage >= HIGH_LEVERAGE_WARN:
-        log_event(runtime, f"⚠ LEVERAGE {cfg.leverage}X increases margin and liquidation sensitivity")
-
+    runtime: Runtime | None = None
+    client: DeltaClient | None = None
+    handoff = False
     try:
-        validate_exchange_connection(app)
-        product = get_product_metadata(app)
-        validate_product(app, product)
-        runtime.product = product
-        log_event(
-            runtime,
-            f"PRODUCT id={product.product_id} tick={product.tick_size} contract_value={product.contract_value}",
-        )
-        apply_leverage(app)
-        runtime.status = "SCANNING"
-        reconcile_position(app)
-    except (ConfigError, DeltaAPIError) as exc:
-        console.print(f"[red]STARTUP FAILED:[/red] {exc}")
-        client.close()
-        return 2
-
-    try:
-        with Live(render_dashboard(app), console=console, refresh_per_second=4, screen=True) as live:
-            while True:
-                poll_started = time.time()
+        started_at = datetime.now(tz=cfg.tz)
+        if headless:
+            raw_keep = os.environ.get("BOT_STOP_KEEP_AFTER")
+            if raw_keep:
                 try:
-                    run_poll(app)
-                except HaltBot:
-                    live.update(render_dashboard(app))
-                    break
-                except DeltaAPIError as exc:
-                    runtime.api_ok = False
-                    runtime.last_error = str(exc)
-                    log_event(runtime, f"API ERROR {exc}", logging.ERROR)
-                elapsed = time.time() - poll_started
-                remain = cfg.polling_seconds - elapsed
-                runtime.next_poll_seconds = 0 if remain <= 0 else int(remain + 0.999)
-                live.update(render_dashboard(app))
-                if remain > 0:
-                    deadline = time.time() + remain
-                    next_draw = time.time() + 1
-                    while time.time() < deadline:
-                        if check_stop_signal(app):
-                            break
-                        left = deadline - time.time()
-                        runtime.next_poll_seconds = 0 if left <= 0 else int(left + 0.999)
-                        if time.time() >= next_draw:
-                            live.update(render_dashboard(app))
-                            next_draw = time.time() + 1
-                        time.sleep(min(0.25, max(0.0, deadline - time.time())))
-                if check_stop_signal(app):
-                    try:
-                        shutdown_bot(app, "MANUAL STOP", close_position=False)
-                    except HaltBot:
-                        live.update(render_dashboard(app))
-                        break
-    except KeyboardInterrupt:
-        runtime.interrupt = True
-        log_event(runtime, "BOT STOPPED — KEYBOARD INTERRUPT")
-        if runtime.position is not None:
-            log_event(runtime, "EXISTING POSITION REMAINS OPEN")
-    finally:
-        client.close()
+                    started_at = datetime.fromtimestamp(float(raw_keep), tz=cfg.tz)
+                except ValueError:
+                    pass
+        runtime = Runtime(status="STARTING", next_poll_seconds=cfg.polling_seconds, started_at=started_at)
+        client = create_delta_client(cfg, env)
+        app = App(cfg=cfg, env=env, client=client, runtime=runtime)
+        _install_signal_handlers(app)
+        _clear_stale_stop_file(runtime.started_at)
 
-    if runtime.position is not None:
+        log_event(runtime, "BOT STARTED")
+        log_event(runtime, f"MODE {cfg.mode}")
+        log_event(runtime, f"SYMBOL {cfg.symbol} TIMEFRAME {cfg.timeframe} LEVERAGE {cfg.leverage}X")
+        if cfg.mode == "LIVE":
+            log_event(runtime, "⚠ LIVE TRADING ENABLED — REAL MONEY AT RISK")
+            runtime.live_warning_shown = False
+        if cfg.leverage >= HIGH_LEVERAGE_WARN:
+            log_event(runtime, f"⚠ LEVERAGE {cfg.leverage}X increases margin and liquidation sensitivity")
+
+        try:
+            validate_exchange_connection(app)
+            product = get_product_metadata(app)
+            validate_product(app, product)
+            runtime.product = product
+            log_event(
+                runtime,
+                f"PRODUCT id={product.product_id} tick={product.tick_size} contract_value={product.contract_value}",
+            )
+            apply_leverage(app)
+            runtime.status = "SCANNING"
+            reconcile_position(app)
+            _load_session_snapshot(app)
+            log_event(runtime, f"BOT READY pid={os.getpid()}")
+        except (ConfigError, DeltaAPIError) as exc:
+            console.print(f"[red]STARTUP FAILED:[/red] {exc}")
+            log.error("STARTUP FAILED: %s", exc)
+            return 2
+
+        if headless:
+            sighup = getattr(signal, "SIGHUP", None)
+            if sighup is not None:
+                signal.signal(sighup, signal.SIG_IGN)
+        preview_deadline = None if preview_seconds is None else time.time() + preview_seconds
+        if headless:
+            handoff = _service_loop(app, None, preview_deadline)
+        else:
+            with Live(render_dashboard(app), console=console, refresh_per_second=4, screen=True) as live:
+                handoff = _service_loop(app, live, preview_deadline)
+    except KeyboardInterrupt:
+        handoff = False
+        if runtime is not None:
+            runtime.interrupt = True
+            log_event(runtime, "BOT STOPPED — KEYBOARD INTERRUPT")
+            if runtime.position is not None:
+                log_event(runtime, "EXISTING POSITION REMAINS OPEN")
+    finally:
+        if client is not None:
+            client.close()
+        _release_pid_lock()
+
+    if handoff and runtime is not None:
+        _write_session_snapshot(runtime, cfg)
+        return EXIT_PREVIEW_ELAPSED
+    if runtime is not None and runtime.position is not None:
         console.print("[yellow]Bot stopped. Position was left open by design.[/yellow]")
     return 0
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    parser = argparse.ArgumentParser(description="Delta Exchange India breakout bot")
+    parser.add_argument(
+        "--headless",
+        action="store_true",
+        help="Poll without the live dashboard. Used by always_running_bot.py.",
+    )
+    args = parser.parse_args()
+    sys.exit(main(headless=args.headless))
