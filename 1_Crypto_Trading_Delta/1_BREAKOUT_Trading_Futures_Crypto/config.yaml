@@ -12,10 +12,10 @@ symbol: "BTCUSD"
 mode: "LIVE"
 
 # Leverage requested for the selected futures product
-leverage: 100
+leverage: 20
 
 # Number of contracts/orders for each entry
-order_size: 10
+order_size: 2
 
 # market_order is recommended for the simple default execution
 # limit_order can be implemented if fully supported
@@ -72,12 +72,12 @@ confirmation:
   # POINTS or PERCENT
   mode: "POINTS"
 
-  # Example: 50 points above/below breakout range
-  value: 50
+  # Example: 150 points above/below breakout range
+  value: 150
 
   # true  = wait for a completed candle close beyond the level
   # false = enter when the live price crosses the level
-  candle_close_confirmation: false
+  candle_close_confirmation: true
 
 # ------------------------------------------------------------
 # TP / SL
@@ -91,7 +91,7 @@ take_profit:
 
   # PNL = dollars
   # PERCENT = percentage from entry price
-  value: 5
+  value: 4
 
 stop_loss:
   enabled: true

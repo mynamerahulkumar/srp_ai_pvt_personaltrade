@@ -1823,7 +1823,11 @@ def _lookup_existing_order(app: App, client_order_id: str) -> dict[str, Any] | N
 
 
 def attach_bracket_orders(app: App) -> None:
-    """Rest a take-profit limit and a stop-limit stop-loss after the market fill."""
+    """Rest a take-profit limit and a market stop-loss after the market fill.
+
+    The stop has no limit price, so a fast move cannot skip the trigger
+    the way a stop-limit at the same price can.
+    """
     pos = app.runtime.position
     product = app.runtime.product
     if pos is None or product is None or pos.paper:
@@ -1840,7 +1844,7 @@ def attach_bracket_orders(app: App) -> None:
         take_profit_order = {"order_type": "limit_order", "stop_price": tp_text, "limit_price": tp_text}
     if sl_price is not None:
         sl_text = _price_str(sl_price, product.tick_size)
-        stop_loss_order = {"order_type": "limit_order", "stop_price": sl_text, "limit_price": sl_text}
+        stop_loss_order = {"order_type": "market_order", "stop_price": sl_text}
     try:
         app.client.place_bracket_orders(
             product_id=product.product_id,
@@ -1850,17 +1854,17 @@ def attach_bracket_orders(app: App) -> None:
             bracket_stop_trigger_method="mark_price",
         )
     except DeltaAPIError as exc:
-        log_event(app.runtime, f"BRACKET ORDER FAILED — PLACING SEPARATE LIMITS {exc}", logging.ERROR)
+        log_event(app.runtime, f"BRACKET ORDER FAILED — PLACING SEPARATE EXITS {exc}", logging.ERROR)
         if _place_separate_exit_orders(app, tp_price, sl_price):
             pos.bracket_placed = True
-            log_event(app.runtime, f"SEPARATE LIMITS PLACED TP {tp_price} SL {sl_price}")
+            log_event(app.runtime, f"SEPARATE EXITS PLACED TP {tp_price} SL {sl_price}")
         return
     pos.bracket_placed = True
-    log_event(app.runtime, f"BRACKET LIMITS PLACED TP {tp_price} SL {sl_price}")
+    log_event(app.runtime, f"BRACKET PLACED TP LIMIT {tp_price} SL MARKET {sl_price}")
 
 
 def _place_separate_exit_orders(app: App, tp_price: float | None, sl_price: float | None) -> bool:
-    """Place reduce-only TP and SL immediately when the bracket endpoint rejects."""
+    """Place a reduce-only TP limit and a market stop when the bracket endpoint rejects."""
     pos = app.runtime.position
     product = app.runtime.product
     if pos is None or product is None:
@@ -1887,18 +1891,17 @@ def _place_separate_exit_orders(app: App, tp_price: float | None, sl_price: floa
             app.client.place_order(
                 size=pos.quantity,
                 side=side,
-                order_type="limit_order",
+                order_type="market_order",
                 product_symbol=product.symbol,
                 reduce_only=True,
                 client_order_id=_client_order_id("s", pos.strategy_id),
-                limit_price=sl_text,
                 stop_order_type="stop_loss_order",
                 stop_price=sl_text,
                 stop_trigger_method="mark_price",
             )
         except DeltaAPIError as exc:
             placed = False
-            log_event(app.runtime, f"SL LIMIT FAILED {exc}", logging.ERROR)
+            log_event(app.runtime, f"SL MARKET FAILED {exc}", logging.ERROR)
     return placed
 
 
