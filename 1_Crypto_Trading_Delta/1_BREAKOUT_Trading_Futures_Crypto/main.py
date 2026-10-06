@@ -586,6 +586,7 @@ class Runtime:
     daily_realized_pnl: float = 0.0
     daily_orders: int = 0
     trading_day: date | None = None
+    booked_strategy_ids: deque[str] = field(default_factory=lambda: deque(maxlen=MAX_CONSUMED_SIGNALS))
     range_high: float | None = None
     range_low: float | None = None
     long_level: float | None = None
@@ -1289,6 +1290,7 @@ def _write_day_ledger(app: App) -> None:
         "daily_orders": app.runtime.daily_orders,
         "daily_realized_pnl": app.runtime.daily_realized_pnl,
         "scheduled_close_done": app.runtime.scheduled_close_done,
+        "booked_strategy_ids": list(app.runtime.booked_strategy_ids),
     }
     temporary = DAY_FILE.with_suffix(".json.tmp")
     try:
@@ -1315,6 +1317,7 @@ def _load_day_ledger(app: App) -> None:
         app.runtime.daily_realized_pnl = 0.0
         app.runtime.scheduled_close_done = False
         app.runtime.daily_loss_announced = False
+        app.runtime.booked_strategy_ids.clear()
         _write_day_ledger(app)
         return
     try:
@@ -1326,6 +1329,12 @@ def _load_day_ledger(app: App) -> None:
     app.runtime.daily_orders = max(0, daily_orders)
     app.runtime.daily_realized_pnl = daily_realized
     app.runtime.scheduled_close_done = bool(raw.get("scheduled_close_done"))
+    app.runtime.booked_strategy_ids.clear()
+    booked = raw.get("booked_strategy_ids")
+    if isinstance(booked, list):
+        for strategy_id in booked[-MAX_CONSUMED_SIGNALS:]:
+            if isinstance(strategy_id, str) and strategy_id not in app.runtime.booked_strategy_ids:
+                app.runtime.booked_strategy_ids.append(strategy_id)
     log_event(
         app.runtime,
         f"DAY LEDGER orders={app.runtime.daily_orders} realized={app.runtime.daily_realized_pnl}",
@@ -1340,12 +1349,25 @@ def refresh_trading_day(app: App) -> None:
         app.runtime.daily_orders = 0
         app.runtime.scheduled_close_done = False
         app.runtime.daily_loss_announced = False
+        app.runtime.booked_strategy_ids.clear()
         _write_day_ledger(app)
         log_event(app.runtime, f"NEW IST TRADING DAY {today.isoformat()}")
 
 
-def daily_pnl_total(app: App, unrealized: float) -> float:
-    return app.runtime.daily_realized_pnl + unrealized
+def daily_pnl_total(app: App, open_unrealized: float) -> float:
+    """Closed IST-day realized plus open mark unrealized. Not for TP/SL."""
+    return app.runtime.daily_realized_pnl + open_unrealized
+
+
+def _book_realized_pnl(app: App, strategy_id: str, pnl: float) -> bool:
+    """Add one closed trade to the day ledger. False when this id was already booked."""
+    if strategy_id in app.runtime.booked_strategy_ids:
+        log_event(app.runtime, f"SKIP DUPLICATE DAY BOOK {strategy_id[:24]}")
+        return False
+    app.runtime.booked_strategy_ids.append(strategy_id)
+    app.runtime.daily_realized_pnl += pnl
+    _write_day_ledger(app)
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -1717,8 +1739,7 @@ def paper_exit_position(app: App, price: float, reason: str) -> float:
     if pos is None or product is None:
         return 0.0
     pnl = calculate_position_pnl(pos, price, product.contract_value)
-    app.runtime.daily_realized_pnl += pnl
-    _write_day_ledger(app)
+    _book_realized_pnl(app, pos.strategy_id, pnl)
     app.runtime.last_trade_summary = f"PAPER EXIT {reason} {_money(pnl)}"
     log_event(app.runtime, f"PAPER EXIT {reason} FINAL PNL {_money(pnl)}")
     app.runtime.position = None
@@ -1944,19 +1965,20 @@ def _bracket_exit_reason(pos: StrategyPosition, price: float) -> str:
 
 
 def finalize_bracket_fill(app: App) -> None:
-    """Record a close already done by the exchange bracket. Do not send another order."""
+    """Record a close already done by the exchange bracket. Do not send another order.
+
+    PnL is taken from mark/last (the fill path), not the theoretical stop price,
+    so a slipped market stop matches the ledger.
+    """
     pos = app.runtime.position
     product = app.runtime.product
     if pos is None or product is None:
         return
     mark = app.runtime.mark_price or app.runtime.current_price or pos.entry_price
     reason = _bracket_exit_reason(pos, mark)
-    exit_price = pos.tp_price if reason == "TP" and pos.tp_price is not None else pos.sl_price
-    if exit_price is None:
-        exit_price = mark
+    exit_price = mark
     pnl = calculate_position_pnl(pos, exit_price, product.contract_value)
-    app.runtime.daily_realized_pnl += pnl
-    _write_day_ledger(app)
+    _book_realized_pnl(app, pos.strategy_id, pnl)
     app.runtime.last_trade_summary = f"LIVE EXIT {reason} {_money(pnl)}"
     log_event(app.runtime, f"BRACKET FILLED {reason} FINAL REALIZED PNL {_money(pnl)}")
     app.runtime.position = None
@@ -2021,8 +2043,7 @@ def place_exit_order(app: App, reason: str, last_price: float) -> float | None:
         app.runtime.status = pos.direction
         return None
     pnl = calculate_position_pnl(pos, exit_price, product.contract_value)
-    app.runtime.daily_realized_pnl += pnl
-    _write_day_ledger(app)
+    _book_realized_pnl(app, pos.strategy_id, pnl)
     app.runtime.last_trade_summary = f"LIVE EXIT {reason} {_money(pnl)}"
     log_event(app.runtime, f"POSITION CLOSED {reason} FINAL REALIZED PNL {_money(pnl)}")
     app.runtime.position = None
@@ -2214,8 +2235,9 @@ def _status_payload(app: App) -> dict[str, Any]:
         "short_level": rt.short_level,
         "waiting_for": _waiting_for(app, digits),
         "has_position": pos is not None,
-        "unrealized": unrealized,
-        "daily_pnl": daily_pnl_total(app, unrealized if pos else 0.0),
+        "unrealized": unrealized if pos is not None else 0.0,
+        "daily_realized": rt.daily_realized_pnl,
+        "daily_pnl": daily_pnl_total(app, unrealized if pos is not None else 0.0),
         "daily_orders": rt.daily_orders,
         "max_orders": cfg.max_orders_per_day,
         "tp_pnl": tp_pnl,
@@ -2368,7 +2390,16 @@ def render_status_panel(payload: dict[str, Any] | None = None, *, status_check: 
                 pos_table.add_row("DISTANCE TO SL", _px(abs(sl_price - current), digits))
         else:
             pos_table.add_row("SL TARGET", _money(-sl_pnl) if sl_pnl is not None else "—")
-    pos_table.add_row("DAILY PNL", _money(_to_float(payload.get("daily_pnl"), 0.0)))
+    open_pnl = unrealized if payload.get("has_position") else 0.0
+    daily_realized = _to_float(payload.get("daily_realized"), _to_float(payload.get("daily_pnl"), 0.0))
+    day_total = _to_float(payload.get("daily_pnl"), 0.0)
+    if daily_realized is None:
+        daily_realized = 0.0
+    if day_total is None:
+        day_total = daily_realized + open_pnl
+    pos_table.add_row("DAILY REALIZED", _money(daily_realized))
+    pos_table.add_row("OPEN PNL", _money(open_pnl, 4) if payload.get("has_position") else _money(0.0))
+    pos_table.add_row("DAY TOTAL", _money(day_total))
     pos_table.add_row("DAILY ORDERS", f"{payload.get('daily_orders', 0)}/{payload.get('max_orders', 0)}")
 
     foot = Table.grid(expand=True, padding=(0, 2))
@@ -2581,6 +2612,7 @@ def _write_session_snapshot(runtime: Runtime, cfg: Config) -> None:
         "daily_realized_pnl": runtime.daily_realized_pnl,
         "scheduled_close_done": runtime.scheduled_close_done,
         "consumed_signal_ids": list(runtime.consumed_signal_ids),
+        "booked_strategy_ids": list(runtime.booked_strategy_ids),
         "last_processed_candle_ts": runtime.last_processed_candle_ts,
     }
     temporary = SESSION_FILE.with_suffix(".json.tmp")
@@ -2637,6 +2669,11 @@ def _load_session_snapshot(app: App) -> None:
         for signal_id in signal_ids[-MAX_CONSUMED_SIGNALS:]:
             if isinstance(signal_id, str) and signal_id not in app.runtime.consumed_signal_ids:
                 app.runtime.consumed_signal_ids.append(signal_id)
+    booked = raw.get("booked_strategy_ids")
+    if isinstance(booked, list):
+        for strategy_id in booked[-MAX_CONSUMED_SIGNALS:]:
+            if isinstance(strategy_id, str) and strategy_id not in app.runtime.booked_strategy_ids:
+                app.runtime.booked_strategy_ids.append(strategy_id)
     candle_ts = raw.get("last_processed_candle_ts")
     if isinstance(candle_ts, int):
         app.runtime.last_processed_candle_ts = candle_ts
@@ -2702,23 +2739,28 @@ def manage_open_position(app: App, last_price: float, mark_price: float) -> None
         except DeltaAPIError as exc:
             app.runtime.last_error = str(exc)
             log_event(app.runtime, f"API ERROR {exc}", logging.ERROR)
-    unrealized = calculate_strategy_pnl(app, _exchange_unrealized(exchange_row), mark_price)
+    strategy_pnl = calculate_strategy_pnl(app, _exchange_unrealized(exchange_row), mark_price)
     app.runtime.exchange_unrealized = _exchange_unrealized(exchange_row)
     app.runtime.current_price = last_price
     app.runtime.mark_price = mark_price
+    open_unrealized = (
+        app.runtime.exchange_unrealized
+        if app.runtime.exchange_unrealized is not None and not pos.paper
+        else calculate_position_pnl(pos, mark_price, product.contract_value)
+    )
 
-    day_total = daily_pnl_total(app, unrealized)
+    day_total = daily_pnl_total(app, open_unrealized)
     if day_total <= -app.cfg.max_loss_per_day_dollar:
         _block_for_daily_loss(app)
         close_strategy_position(app, "DAILY LOSS", last_price)
         return
 
-    if not pos.bracket_placed and check_take_profit(app, unrealized, mark_price):
+    if not pos.bracket_placed and check_take_profit(app, strategy_pnl, mark_price):
         pnl = close_strategy_position(app, "TP", last_price)
         _maybe_stop_after_exit(app, "TP", pnl)
         return
 
-    if not pos.bracket_placed and check_stop_loss(app, unrealized, mark_price):
+    if not pos.bracket_placed and check_stop_loss(app, strategy_pnl, mark_price):
         pnl = close_strategy_position(app, "SL", last_price)
         _maybe_stop_after_exit(app, "SL", pnl)
         return
