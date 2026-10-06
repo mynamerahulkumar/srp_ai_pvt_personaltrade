@@ -609,6 +609,7 @@ class Runtime:
     last_market_fetch_ts: float = 0.0
     scheduled_close_done: bool = False
     daily_loss_announced: bool = False
+    last_day_sync_ts: float = 0.0
     startup_breakout_checked: bool = False
     resume_after_candle_open: int | None = None
     flat_orders_need_cancel: bool = False
@@ -895,6 +896,45 @@ class DeltaClient:
             "client_order_id": client_order_id,
         }
         return self._mutate("DELETE", "/orders", payload)
+
+    def get_fills(
+        self,
+        *,
+        product_id: int | None = None,
+        start_time_us: int | None = None,
+        end_time_us: int | None = None,
+        page_size: int = 100,
+        after: str | None = None,
+    ) -> dict[str, Any]:
+        """Trade fills. start_time_us/end_time_us are unix epoch microseconds."""
+        params: dict[str, Any] = {"page_size": page_size}
+        if product_id is not None:
+            params["product_ids"] = str(product_id)
+        if start_time_us is not None:
+            params["start_time"] = start_time_us
+        if end_time_us is not None:
+            params["end_time"] = end_time_us
+        if after is not None:
+            params["after"] = after
+        return self.send_request("GET", "/fills", params=params, auth=True)
+
+    def get_wallet_transactions(
+        self,
+        *,
+        start_time_us: int | None = None,
+        end_time_us: int | None = None,
+        page_size: int = 100,
+        after: str | None = None,
+    ) -> dict[str, Any]:
+        """Wallet ledger (cashflow, commission, funding). Times are unix microseconds."""
+        params: dict[str, Any] = {"page_size": page_size}
+        if start_time_us is not None:
+            params["start_time"] = start_time_us
+        if end_time_us is not None:
+            params["end_time"] = end_time_us
+        if after is not None:
+            params["after"] = after
+        return self.send_request("GET", "/wallet/transactions", params=params, auth=True)
 
 
 def create_delta_client(cfg: Config, env: Environment) -> DeltaClient:
@@ -1282,6 +1322,92 @@ def trading_day_now(cfg: Config) -> date:
     return datetime.now(tz=cfg.tz).date()
 
 
+def _ist_day_bounds_us(cfg: Config) -> tuple[int, int]:
+    """Unix microseconds for [IST midnight today, now]. Delta history filters use us."""
+    now = datetime.now(tz=cfg.tz)
+    start = datetime(now.year, now.month, now.day, tzinfo=cfg.tz)
+    return int(start.timestamp() * 1_000_000), int(now.timestamp() * 1_000_000)
+
+
+def _paginate_wallet_transactions(app: App, start_us: int, end_us: int) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    after: str | None = None
+    for _ in range(30):
+        payload = app.client.get_wallet_transactions(
+            start_time_us=start_us,
+            end_time_us=end_us,
+            page_size=100,
+            after=after,
+        )
+        batch = _unwrap(payload)
+        if isinstance(batch, list):
+            rows.extend(r for r in batch if isinstance(r, dict))
+        meta = payload.get("meta") if isinstance(payload, dict) else None
+        next_after = meta.get("after") if isinstance(meta, dict) else None
+        if not next_after or next_after == after:
+            break
+        after = str(next_after)
+    return rows
+
+
+def _exchange_day_realized(app: App) -> float | None:
+    """Sum IST-day wallet cashflow+commission+funding for this product. None on failure."""
+    product = app.runtime.product
+    if product is None or not app.env.has_credentials:
+        return None
+    start_us, end_us = _ist_day_bounds_us(app.cfg)
+    try:
+        rows = _paginate_wallet_transactions(app, start_us, end_us)
+    except DeltaAPIError as exc:
+        app.runtime.api_ok = False
+        app.runtime.last_error = str(exc)
+        log_event(app.runtime, f"DAY SYNC FAILED {exc}", logging.WARNING)
+        return None
+    total = 0.0
+    pid = product.product_id
+    symbol = product.symbol
+    for row in rows:
+        row_pid = _to_int(row.get("product_id"))
+        meta = row.get("meta_data") if isinstance(row.get("meta_data"), dict) else {}
+        row_sym = str(meta.get("product_symbol") or row.get("product_symbol") or "")
+        if row_pid is not None and row_pid != pid:
+            continue
+        if row_pid is None and row_sym and row_sym != symbol:
+            continue
+        if row_pid is None and not row_sym:
+            continue
+        amount = _to_float(row.get("amount"))
+        if amount is None:
+            continue
+        total += amount
+    return total
+
+
+def _sync_daily_realized_from_exchange(app: App, *, force: bool = False) -> bool:
+    """Overwrite local day realized with Delta wallet totals for this IST day."""
+    if app.cfg.mode != "LIVE" or not app.env.has_credentials or app.runtime.product is None:
+        return False
+    now = time.time()
+    if not force and now - app.runtime.last_day_sync_ts < 60.0:
+        return False
+    realized = _exchange_day_realized(app)
+    if realized is None:
+        return False
+    app.runtime.last_day_sync_ts = now
+    previous = app.runtime.daily_realized_pnl
+    app.runtime.daily_realized_pnl = realized
+    if realized > -app.cfg.max_loss_per_day_dollar:
+        app.runtime.daily_loss_announced = False
+        if app.runtime.entries_blocked_reason == "DAILY LOSS LIMIT REACHED":
+            app.runtime.entries_blocked_reason = None
+    _write_day_ledger(app)
+    log_event(
+        app.runtime,
+        f"DAY LEDGER SYNCED FROM EXCHANGE realized={realized:.4f} (was {previous:.4f})",
+    )
+    return True
+
+
 def _write_day_ledger(app: App) -> None:
     """Save today's IST risk counters. A failed write must not stop trading."""
     day = app.runtime.trading_day or trading_day_now(app.cfg)
@@ -1352,6 +1478,7 @@ def refresh_trading_day(app: App) -> None:
         app.runtime.booked_strategy_ids.clear()
         _write_day_ledger(app)
         log_event(app.runtime, f"NEW IST TRADING DAY {today.isoformat()}")
+        _sync_daily_realized_from_exchange(app, force=True)
 
 
 def daily_pnl_total(app: App, open_unrealized: float) -> float:
@@ -1367,6 +1494,8 @@ def _book_realized_pnl(app: App, strategy_id: str, pnl: float) -> bool:
     app.runtime.booked_strategy_ids.append(strategy_id)
     app.runtime.daily_realized_pnl += pnl
     _write_day_ledger(app)
+    if app.cfg.mode == "LIVE":
+        _sync_daily_realized_from_exchange(app, force=True)
     return True
 
 
@@ -2751,9 +2880,17 @@ def manage_open_position(app: App, last_price: float, mark_price: float) -> None
 
     day_total = daily_pnl_total(app, open_unrealized)
     if day_total <= -app.cfg.max_loss_per_day_dollar:
-        _block_for_daily_loss(app)
-        close_strategy_position(app, "DAILY LOSS", last_price)
-        return
+        _sync_daily_realized_from_exchange(app, force=False)
+        open_unrealized = (
+            app.runtime.exchange_unrealized
+            if app.runtime.exchange_unrealized is not None and not pos.paper
+            else calculate_position_pnl(pos, mark_price, product.contract_value)
+        )
+        day_total = daily_pnl_total(app, open_unrealized)
+        if day_total <= -app.cfg.max_loss_per_day_dollar:
+            _block_for_daily_loss(app)
+            close_strategy_position(app, "DAILY LOSS", last_price)
+            return
 
     if not pos.bracket_placed and check_take_profit(app, strategy_pnl, mark_price):
         pnl = close_strategy_position(app, "TP", last_price)
@@ -2988,8 +3125,10 @@ def run_poll(app: App) -> None:
         return
 
     if daily_pnl_total(app, 0.0) <= -app.cfg.max_loss_per_day_dollar:
-        _block_for_daily_loss(app)
-        return
+        _sync_daily_realized_from_exchange(app, force=False)
+        if daily_pnl_total(app, 0.0) <= -app.cfg.max_loss_per_day_dollar:
+            _block_for_daily_loss(app)
+            return
 
     with app.runtime.candle_lock:
         completed = list(app.runtime.completed_candles)
@@ -3126,6 +3265,7 @@ def main(preview_seconds: float | None = None, headless: bool = False) -> int:
             reconcile_position(app)
             _load_day_ledger(app)
             _load_session_snapshot(app)
+            _sync_daily_realized_from_exchange(app, force=True)
             log_event(runtime, f"BOT READY pid={os.getpid()}")
             _publish_status(app)
         except (ConfigError, DeltaAPIError) as exc:
