@@ -1129,12 +1129,13 @@ def split_completed_candles(
 
 
 def market_data_is_stale(app: App, completed: list[Candle]) -> bool:
-    """Block entries when candles or ticker age beyond a safe window."""
+    """Block entries unless the prior completed bar is the just-closed Delta candle."""
     seconds = RESOLUTION_SECONDS[app.cfg.timeframe]
     if not completed:
         return True
-    age = time.time() - completed[-1].time
-    if age > seconds * 2.5:
+    current_open = candle_window_start(time.time(), app.cfg.timeframe, app.cfg.tz)
+    expected_prior = current_open - seconds
+    if completed[-1].time != expected_prior:
         return True
     ticker_age = time.time() - app.runtime.last_market_fetch_ts
     if ticker_age > max(30.0, app.cfg.polling_seconds * 4):
@@ -1384,7 +1385,11 @@ def _exchange_day_realized(app: App) -> float | None:
 
 
 def _sync_daily_realized_from_exchange(app: App, *, force: bool = False) -> bool:
-    """Overwrite local day realized with Delta wallet totals for this IST day."""
+    """Overwrite local day realized with Delta wallet totals for this IST day.
+
+    Exchange is the LIVE source of truth for the daily-loss gate. A successful
+    sync never leaves a more-negative stale local value in place.
+    """
     if app.cfg.mode != "LIVE" or not app.env.has_credentials or app.runtime.product is None:
         return False
     now = time.time()
@@ -1396,15 +1401,17 @@ def _sync_daily_realized_from_exchange(app: App, *, force: bool = False) -> bool
     app.runtime.last_day_sync_ts = now
     previous = app.runtime.daily_realized_pnl
     app.runtime.daily_realized_pnl = realized
+    # Only clear the gate when exchange confirms the day is under the limit.
     if realized > -app.cfg.max_loss_per_day_dollar:
         app.runtime.daily_loss_announced = False
         if app.runtime.entries_blocked_reason == "DAILY LOSS LIMIT REACHED":
             app.runtime.entries_blocked_reason = None
     _write_day_ledger(app)
-    log_event(
-        app.runtime,
-        f"DAY LEDGER SYNCED FROM EXCHANGE realized={realized:.4f} (was {previous:.4f})",
-    )
+    if abs(realized - previous) >= 0.01:
+        log_event(
+            app.runtime,
+            f"DAY LEDGER SYNCED FROM EXCHANGE realized={realized:.4f} (was {previous:.4f})",
+        )
     return True
 
 
@@ -1417,6 +1424,9 @@ def _write_day_ledger(app: App) -> None:
         "daily_realized_pnl": app.runtime.daily_realized_pnl,
         "scheduled_close_done": app.runtime.scheduled_close_done,
         "booked_strategy_ids": list(app.runtime.booked_strategy_ids),
+        "consumed_signal_ids": list(app.runtime.consumed_signal_ids),
+        "resume_after_candle_open": app.runtime.resume_after_candle_open,
+        "startup_breakout_checked": app.runtime.startup_breakout_checked,
     }
     temporary = DAY_FILE.with_suffix(".json.tmp")
     try:
@@ -1443,7 +1453,10 @@ def _load_day_ledger(app: App) -> None:
         app.runtime.daily_realized_pnl = 0.0
         app.runtime.scheduled_close_done = False
         app.runtime.daily_loss_announced = False
+        app.runtime.resume_after_candle_open = None
+        app.runtime.startup_breakout_checked = False
         app.runtime.booked_strategy_ids.clear()
+        app.runtime.consumed_signal_ids.clear()
         _write_day_ledger(app)
         return
     try:
@@ -1455,12 +1468,25 @@ def _load_day_ledger(app: App) -> None:
     app.runtime.daily_orders = max(0, daily_orders)
     app.runtime.daily_realized_pnl = daily_realized
     app.runtime.scheduled_close_done = bool(raw.get("scheduled_close_done"))
+    app.runtime.startup_breakout_checked = bool(raw.get("startup_breakout_checked"))
     app.runtime.booked_strategy_ids.clear()
     booked = raw.get("booked_strategy_ids")
     if isinstance(booked, list):
         for strategy_id in booked[-MAX_CONSUMED_SIGNALS:]:
             if isinstance(strategy_id, str) and strategy_id not in app.runtime.booked_strategy_ids:
                 app.runtime.booked_strategy_ids.append(strategy_id)
+    consumed = raw.get("consumed_signal_ids")
+    if isinstance(consumed, list):
+        for signal_id in consumed[-MAX_CONSUMED_SIGNALS:]:
+            if isinstance(signal_id, str) and signal_id not in app.runtime.consumed_signal_ids:
+                app.runtime.consumed_signal_ids.append(signal_id)
+    gate = raw.get("resume_after_candle_open")
+    if isinstance(gate, int):
+        window = candle_window_start(time.time(), app.cfg.timeframe, app.cfg.tz)
+        if window <= gate:
+            app.runtime.resume_after_candle_open = gate
+        else:
+            app.runtime.resume_after_candle_open = None
     log_event(
         app.runtime,
         f"DAY LEDGER orders={app.runtime.daily_orders} realized={app.runtime.daily_realized_pnl}",
@@ -1475,7 +1501,10 @@ def refresh_trading_day(app: App) -> None:
         app.runtime.daily_orders = 0
         app.runtime.scheduled_close_done = False
         app.runtime.daily_loss_announced = False
+        app.runtime.resume_after_candle_open = None
+        app.runtime.startup_breakout_checked = False
         app.runtime.booked_strategy_ids.clear()
+        app.runtime.consumed_signal_ids.clear()
         _write_day_ledger(app)
         log_event(app.runtime, f"NEW IST TRADING DAY {today.isoformat()}")
         _sync_daily_realized_from_exchange(app, force=True)
@@ -1746,6 +1775,7 @@ def mark_signal_consumed(app: App, signal: BreakoutSignal) -> None:
         app.runtime.consumed_signal_ids.append(signal.signal_id)
     app.runtime.last_signal = signal
     app.runtime.last_processed_candle_ts = signal.candle_timestamp
+    _write_day_ledger(app)
 
 
 # ---------------------------------------------------------------------------
@@ -1929,13 +1959,13 @@ def place_entry_order(app: App, signal: BreakoutSignal, last_price: float) -> No
             log_event(app.runtime, f"LIMIT CANCEL FAILED {exc}", logging.ERROR)
         app.runtime.pending_client_order_id = None
         app.runtime.status = "SCANNING"
-        mark_signal_consumed(app, signal)
+        # Do not consume the signal — allow a later poll to retry this breakout.
         return
     if state in {"cancelled", "canceled", "rejected"}:
         app.runtime.pending_client_order_id = None
         app.runtime.status = "SCANNING"
         log_event(app.runtime, f"ENTRY {state.upper()}")
-        mark_signal_consumed(app, signal)
+        # Do not consume — rejected/cancelled is not a filled breakout.
         return
     entry_price = _fill_price(filled, last_price)
     app.runtime.position = StrategyPosition(
@@ -2250,6 +2280,7 @@ def reconcile_position(app: App) -> None:
                 app.runtime.exchange_unrealized = None
                 if app.runtime.status in {"LONG", "SHORT", "ENTERING"}:
                     app.runtime.status = "SCANNING"
+                _sync_daily_realized_from_exchange(app, force=True)
                 _arm_next_candle(app)
         return
 
@@ -2743,6 +2774,8 @@ def _write_session_snapshot(runtime: Runtime, cfg: Config) -> None:
         "consumed_signal_ids": list(runtime.consumed_signal_ids),
         "booked_strategy_ids": list(runtime.booked_strategy_ids),
         "last_processed_candle_ts": runtime.last_processed_candle_ts,
+        "resume_after_candle_open": runtime.resume_after_candle_open,
+        "startup_breakout_checked": runtime.startup_breakout_checked,
     }
     temporary = SESSION_FILE.with_suffix(".json.tmp")
     temporary.write_text(json.dumps(payload, separators=(",", ":")), encoding="utf-8")
@@ -2806,6 +2839,14 @@ def _load_session_snapshot(app: App) -> None:
     candle_ts = raw.get("last_processed_candle_ts")
     if isinstance(candle_ts, int):
         app.runtime.last_processed_candle_ts = candle_ts
+    app.runtime.startup_breakout_checked = bool(raw.get("startup_breakout_checked"))
+    gate = raw.get("resume_after_candle_open")
+    if isinstance(gate, int):
+        window = candle_window_start(time.time(), app.cfg.timeframe, app.cfg.tz)
+        if window <= gate:
+            app.runtime.resume_after_candle_open = gate
+        else:
+            app.runtime.resume_after_candle_open = None
     _discard_session_snapshot()
     _write_day_ledger(app)
     log_event(
@@ -2912,17 +2953,19 @@ def manage_open_position(app: App, last_price: float, mark_price: float) -> None
         return
 
 
-def _arm_next_candle(app: App) -> None:
-    """After a flat exit, block entries until the next Delta candle opens."""
+def _arm_next_candle(app: App, *, reason: str = "POSITION FLAT — WAITING FOR NEXT CANDLE") -> None:
+    """After a flat exit (or ignored startup breakout), block entries until the next Delta candle opens."""
     window = candle_window_start(time.time(), app.cfg.timeframe, app.cfg.tz)
     if app.runtime.resume_after_candle_open == window:
         _cancel_flat_orders(app)
+        _write_day_ledger(app)
         return
     app.runtime.resume_after_candle_open = window
     app.runtime.flat_orders_need_cancel = app.cfg.mode == "LIVE"
     app.runtime.entries_blocked_reason = "WAITING FOR NEXT CANDLE"
-    log_event(app.runtime, "POSITION FLAT — WAITING FOR NEXT CANDLE")
+    log_event(app.runtime, reason)
     _cancel_flat_orders(app)
+    _write_day_ledger(app)
 
 
 def _cancel_flat_orders(app: App) -> None:
@@ -2948,6 +2991,7 @@ def _waiting_for_next_candle(app: App) -> bool:
     if window <= gate:
         return True
     app.runtime.resume_after_candle_open = None
+    _write_day_ledger(app)
     return False
 
 
@@ -2958,6 +3002,9 @@ def _breakout_ready(app: App, completed: list[Candle], live_price: float | None)
     if app.runtime.product is None or len(completed) < needed:
         return False
     if not app.cfg.confirmation.candle_close_confirmation and live_price is None:
+        return False
+    # Require the prior completed bar to be the just-closed Delta candle.
+    if market_data_is_stale(app, completed):
         return False
     return True
 
@@ -2972,6 +3019,11 @@ def scan_for_entry(app: App, last_price: float, completed: list[Candle]) -> None
         if app.runtime.status not in {"WAITING", "STOPPED"}:
             app.runtime.status = "SCANNING"
         return
+    if market_data_is_stale(app, completed):
+        app.runtime.entries_blocked_reason = "WAITING FOR CANDLES"
+        if app.runtime.status not in {"WAITING", "STOPPED"}:
+            app.runtime.status = "SCANNING"
+        return
     if not app.cfg.confirmation.candle_close_confirmation and completed:
         app.runtime.last_processed_candle_ts = completed[-1].time
 
@@ -2981,8 +3033,10 @@ def scan_for_entry(app: App, last_price: float, completed: list[Candle]) -> None
 
     if not app.runtime.startup_breakout_checked and _breakout_ready(app, completed, last_price):
         app.runtime.startup_breakout_checked = True
+        _write_day_ledger(app)
         if signal is not None:
             mark_signal_consumed(app, signal)
+            _arm_next_candle(app, reason=f"STARTUP BREAKOUT IGNORED {signal.direction} — WAITING FOR NEXT CANDLE")
             app.runtime.entries_blocked_reason = "STARTUP BREAKOUT IGNORED"
             app.runtime.status = "SCANNING"
             log_event(
@@ -3026,13 +3080,22 @@ def scan_for_entry(app: App, last_price: float, completed: list[Candle]) -> None
 
 
 def _apply_candle_range(app: App, completed: list[Candle]) -> None:
-    """Store the previous-candle range. Leaves the last range in place when this fetch is short."""
+    """Store the previous-candle range shown on the dashboard.
+
+    When candle-close confirmation is on, the range is the bars before the
+    latest completed candle (same reference detect_breakout_signal uses).
+    """
     app.runtime.completed_candles = completed
     app.runtime.market_stale = market_data_is_stale(app, completed)
     lookback = app.cfg.strategy.breakout_lookback_candles
-    if len(completed) < lookback or app.runtime.product is None:
+    close_confirm = app.cfg.confirmation.candle_close_confirmation
+    needed = lookback + (1 if close_confirm else 0)
+    if len(completed) < needed or app.runtime.product is None:
         return
-    range_high, range_low = calculate_breakout_range(completed, lookback)
+    source = completed[:-1] if close_confirm else completed
+    if len(source) < lookback:
+        return
+    range_high, range_low = calculate_breakout_range(source, lookback)
     app.runtime.range_high = range_high
     app.runtime.range_low = range_low
     app.runtime.long_level, app.runtime.short_level = calculate_breakout_levels(
