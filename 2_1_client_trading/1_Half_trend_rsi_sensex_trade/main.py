@@ -27,7 +27,7 @@ import yaml
 # ============================================================
 
 BOT_NAME = "SRP HALF TREND OPTIONS ENGINE"
-BOT_VERSION = "1.0.0"
+BOT_VERSION = "2.0.0"
 ALGO_TAG_PREFIX = "HT"
 ATR_PERIOD = 100
 NOTIONAL_WARNING_RS = 50_000
@@ -39,7 +39,7 @@ CONFIG_PATH = ROOT / "config.yaml"
 ENV_PATH = ROOT / ".env"
 STOP_PATH = ROOT / ".bot_stop"
 MASTER_PATH = ROOT / "api-scrip-master.csv"
-DASHBOARD_WIDTH = 58
+DASHBOARD_WIDTH = 60
 
 # Symbol text used to find the index row in the security master.
 # These are names, not security IDs. IDs are read from the master.
@@ -76,40 +76,52 @@ class AppConfig:
 
     trading_mode: str
     underlying: str
+    candle_mode: str
     timeframe_minutes: int
+    polling_seconds: int
     amplitude: int
     channel_deviation: float
-    signal_confirmation: str
-    exit_on_opposite_signal: bool
+    sideways_filter_enabled: bool
+    sideways_lookback: int
+    sideways_tolerance_points: float
+    rsi_enabled: bool
+    rsi_period: int
+    rsi_bullish_min: float
+    rsi_bearish_max: float
+    renko_brick_size_points: float
+    renko_entry_confirmation_bricks: int
+    renko_exit_confirmation_bricks: int
     expiry_mode: str
     expiry: str
-    strike_mode: str
+    selection_mode: str
     strike_offset: int
+    target_premium: float
+    premium_tolerance: float
     lots: int
     order_type: str
     product_type: str
-    holding_mode: str
+    tp_sl_mode: str
     tp_enabled: bool
-    tp_type: str
-    tp_value: float
+    tp_points: float
     sl_enabled: bool
-    sl_type: str
-    sl_value: float
+    sl_points: float
+    stop_bot_after_tp_sl: bool
     max_open_strategies: int
     max_orders_per_day: int
     max_loss_per_day_inr: float
     no_reentry_after_stop_loss: bool
     no_reentry_after_max_loss: bool
-    session_enabled: bool
+    exit_on_opposite_signal: bool
     timezone_name: str
     run_mode: str
     start_time: str
     stop_time: str
     close_all_positions_at_stop: bool
     stop_bot_after_close: bool
-    polling_seconds: int
     post_close_polls: int
     post_close_poll_seconds: int
+    backtest_start_date: str
+    backtest_end_date: str
 
     @property
     def timezone(self) -> ZoneInfo:
@@ -198,6 +210,14 @@ def _parse_clock(value: str, label: str) -> clock_time:
     return clock_time(hour, minute)
 
 
+def _parse_iso_date(value: str, label: str) -> date:
+    """Parse YYYY-MM-DD. Invalid dates are rejected before any market call."""
+    try:
+        return datetime.strptime(value, "%Y-%m-%d").date()
+    except ValueError as exc:
+        raise ValueError(f"{label} must be YYYY-MM-DD") from exc
+
+
 def validate_config(config: AppConfig) -> None:
     """Reject settings that would make orders, sessions, or exits ambiguous.
 
@@ -211,64 +231,71 @@ def validate_config(config: AppConfig) -> None:
         None. Raises ValueError with the first problem found.
 
     Trading use:
-        Keeps PAPER/LIVE, the index, the product type, and the session clock
-        inside the combinations this bot can actually execute.
+        Keeps PAPER, LIVE, and BACKTEST, the index, the product type, and the
+        session clock inside the combinations this bot can actually execute.
     """
     if config.underlying not in UNDERLYING_SPECS:
         raise ValueError("underlying must be SENSEX, NIFTY, or BANKNIFTY")
-    if config.trading_mode not in {"PAPER", "LIVE"}:
-        raise ValueError("trading_mode must be PAPER or LIVE")
+    if config.trading_mode not in {"PAPER", "LIVE", "BACKTEST"}:
+        raise ValueError("trading_mode must be PAPER, LIVE, or BACKTEST")
+    if config.candle_mode not in {"NORMAL", "RENKO"}:
+        raise ValueError("candle_mode must be NORMAL or RENKO")
     if config.run_mode not in {"CONTINUOUS", "SCHEDULED"}:
         raise ValueError("run_mode must be CONTINUOUS or SCHEDULED")
-    if config.strike_mode not in {"ATM", "ITM", "OTM"}:
-        raise ValueError("strike_mode must be ATM, ITM, or OTM")
+    if config.selection_mode not in {"ATM", "ITM", "OTM", "PREMIUM"}:
+        raise ValueError("selection_mode must be ATM, ITM, OTM, or PREMIUM")
     if config.expiry_mode not in {"NEAREST", "CONFIGURED"}:
         raise ValueError("expiry_mode must be NEAREST or CONFIGURED")
-    if config.tp_type not in {"PERCENT", "ABSOLUTE"} or config.sl_type not in {"PERCENT", "ABSOLUTE"}:
-        raise ValueError("TP/SL type must be PERCENT or ABSOLUTE")
-    if config.signal_confirmation != "CANDLE_CLOSE":
-        raise ValueError("signal_confirmation must be CANDLE_CLOSE")
+    if config.tp_sl_mode not in {"UNDERLYING_POINTS", "OPTION_PREMIUM_POINTS"}:
+        raise ValueError("tp_sl_mode must be UNDERLYING_POINTS or OPTION_PREMIUM_POINTS")
     if config.timeframe_minutes not in DHAN_INTERVALS:
         raise ValueError("timeframe_minutes must be one of 1, 5, 15, 25, 60")
     if config.amplitude < 1:
         raise ValueError("amplitude must be at least 1")
     if config.channel_deviation <= 0:
         raise ValueError("channel_deviation must be greater than 0")
+    if config.sideways_lookback < 2:
+        raise ValueError("sideways_lookback must be at least 2")
+    if config.sideways_tolerance_points < 0:
+        raise ValueError("sideways_tolerance_points cannot be negative")
+    if config.rsi_period < 2:
+        raise ValueError("rsi period must be at least 2")
+    if config.renko_brick_size_points <= 0:
+        raise ValueError("renko brick_size_points must be greater than 0")
+    if config.renko_entry_confirmation_bricks < 1 or config.renko_exit_confirmation_bricks < 1:
+        raise ValueError("renko confirmation counts must be at least 1")
     if config.lots < 1:
         raise ValueError("lots must be at least 1")
     if config.strike_offset < 0:
         raise ValueError("strike_offset cannot be negative")
-    if config.strike_mode == "ATM" and config.strike_offset != 0:
-        raise ValueError("ATM strike_mode requires strike_offset 0")
+    if config.selection_mode == "ATM" and config.strike_offset != 0:
+        raise ValueError("ATM selection_mode requires strike_offset 0")
+    if config.selection_mode == "PREMIUM" and config.target_premium <= 0:
+        raise ValueError("PREMIUM selection requires target_premium greater than 0")
+    if config.selection_mode == "PREMIUM" and config.premium_tolerance < 0:
+        raise ValueError("premium_tolerance cannot be negative")
     if config.order_type not in {"LIMIT", "MARKET"}:
         raise ValueError("order_type must be LIMIT or MARKET")
     if config.product_type not in {"INTRADAY", "MARGIN"}:
         raise ValueError("product_type must be INTRADAY or MARGIN")
-    if config.holding_mode not in {"INTRADAY", "SWING", "POSITIONAL"}:
-        raise ValueError("holding_mode must be INTRADAY, SWING, or POSITIONAL")
-    if config.holding_mode == "INTRADAY" and config.product_type != "INTRADAY":
-        raise ValueError("INTRADAY holding_mode requires product_type INTRADAY")
-    if config.holding_mode in {"SWING", "POSITIONAL"} and config.product_type != "MARGIN":
-        raise ValueError("SWING and POSITIONAL require product_type MARGIN")
     if config.max_open_strategies != 1:
         raise ValueError("max_open_strategies must be 1")
     if config.max_orders_per_day < 1:
         raise ValueError("max_orders_per_day must be at least 1")
     if config.max_loss_per_day_inr <= 0:
         raise ValueError("max_loss_per_day_inr must be greater than 0")
-    if config.tp_enabled and config.tp_value <= 0:
-        raise ValueError("take profit value must be greater than 0")
-    if config.sl_enabled and config.sl_value <= 0:
-        raise ValueError("stop loss value must be greater than 0")
-    if config.sl_enabled and config.sl_type == "PERCENT" and config.sl_value >= 100:
-        raise ValueError("percent stop loss must be below 100")
+    if config.tp_enabled and config.tp_points <= 0:
+        raise ValueError("take profit points must be greater than 0")
+    if config.sl_enabled and config.sl_points <= 0:
+        raise ValueError("stop loss points must be greater than 0")
     if config.polling_seconds < 1 or config.post_close_polls < 1 or config.post_close_poll_seconds < 1:
         raise ValueError("polling and post-close settings must be at least 1")
     if config.expiry_mode == "CONFIGURED":
-        try:
-            datetime.strptime(config.expiry, "%Y-%m-%d")
-        except ValueError as exc:
-            raise ValueError("expiry must be YYYY-MM-DD when expiry_mode is CONFIGURED") from exc
+        _parse_iso_date(config.expiry, "expiry")
+    start_date = _parse_iso_date(config.backtest_start_date, "backtest.start_date")
+    end_date = _parse_iso_date(config.backtest_end_date, "backtest.end_date")
+    if start_date > end_date:
+        raise ValueError("backtest.start_date must be on or before backtest.end_date")
     try:
         ZoneInfo(config.timezone_name)
     except Exception as exc:
@@ -302,65 +329,120 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     except yaml.YAMLError as exc:
         raise ValueError(f"config.yaml is not valid YAML: {exc}") from exc
     root = _require_mapping(raw, "config.yaml")
-    _reject_unknown(root, {"mode", "market", "strategy", "option", "execution", "risk", "session", "runtime"}, "top-level")
-    mode = _require_mapping(root.get("mode"), "mode")
-    market = _require_mapping(root.get("market"), "market")
-    strategy = _require_mapping(root.get("strategy"), "strategy")
+    allowed_root = {
+        "trading_mode",
+        "underlying",
+        "candle_mode",
+        "timeframe_minutes",
+        "polling_seconds",
+        "halftrend",
+        "rsi",
+        "renko",
+        "option",
+        "execution",
+        "risk",
+        "timezone",
+        "run_mode",
+        "start_time",
+        "stop_time",
+        "close_all_positions_at_stop",
+        "stop_bot_after_close",
+        "post_close_polls",
+        "post_close_poll_seconds",
+        "backtest",
+    }
+    _reject_unknown(root, allowed_root, "top-level")
+    halftrend = _require_mapping(root.get("halftrend"), "halftrend")
+    rsi = _require_mapping(root.get("rsi"), "rsi")
+    renko = _require_mapping(root.get("renko"), "renko")
     option = _require_mapping(root.get("option"), "option")
     execution = _require_mapping(root.get("execution"), "execution")
     risk = _require_mapping(root.get("risk"), "risk")
-    session = _require_mapping(root.get("session"), "session")
-    runtime = _require_mapping(root.get("runtime"), "runtime")
-    _reject_unknown(mode, {"trading_mode"}, "mode")
-    _reject_unknown(market, {"underlying", "timeframe_minutes"}, "market")
-    _reject_unknown(strategy, {"amplitude", "channel_deviation", "signal_confirmation", "exit_on_opposite_signal"}, "strategy")
-    _reject_unknown(option, {"expiry_mode", "expiry", "strike_mode", "strike_offset", "lots"}, "option")
-    _reject_unknown(execution, {"order_type", "product_type", "holding_mode"}, "execution")
-    _reject_unknown(risk, {"take_profit", "stop_loss", "max_open_strategies", "max_orders_per_day", "max_loss_per_day_inr", "no_reentry_after_stop_loss", "no_reentry_after_max_loss"}, "risk")
-    _reject_unknown(session, {"enabled", "timezone", "run_mode", "start_time", "stop_time", "close_all_positions_at_stop", "stop_bot_after_close"}, "session")
-    _reject_unknown(runtime, {"polling_seconds", "post_close_polls", "post_close_poll_seconds"}, "runtime")
+    backtest = _require_mapping(root.get("backtest"), "backtest")
+    _reject_unknown(
+        halftrend,
+        {"amplitude", "channel_deviation", "sideways_filter_enabled", "sideways_lookback", "sideways_tolerance_points"},
+        "halftrend",
+    )
+    _reject_unknown(rsi, {"enabled", "period", "bullish_min", "bearish_max"}, "rsi")
+    _reject_unknown(renko, {"brick_size_points", "entry_confirmation_bricks", "exit_confirmation_bricks"}, "renko")
+    _reject_unknown(
+        option,
+        {"expiry_mode", "expiry", "selection_mode", "strike_offset", "target_premium", "premium_tolerance", "lots"},
+        "option",
+    )
+    _reject_unknown(execution, {"order_type", "product_type"}, "execution")
+    _reject_unknown(
+        risk,
+        {
+            "tp_sl_mode",
+            "take_profit",
+            "stop_loss",
+            "stop_bot_after_tp_sl",
+            "max_open_strategies",
+            "max_orders_per_day",
+            "max_loss_per_day_inr",
+            "no_reentry_after_stop_loss",
+            "no_reentry_after_max_loss",
+            "exit_on_opposite_signal",
+        },
+        "risk",
+    )
+    _reject_unknown(backtest, {"start_date", "end_date"}, "backtest")
     take_profit = _require_mapping(risk.get("take_profit"), "risk.take_profit")
     stop_loss = _require_mapping(risk.get("stop_loss"), "risk.stop_loss")
-    _reject_unknown(take_profit, {"enabled", "type", "value"}, "risk.take_profit")
-    _reject_unknown(stop_loss, {"enabled", "type", "value"}, "risk.stop_loss")
+    _reject_unknown(take_profit, {"enabled", "points"}, "risk.take_profit")
+    _reject_unknown(stop_loss, {"enabled", "points"}, "risk.stop_loss")
     expiry = "" if option.get("expiry") is None else str(option.get("expiry")).strip()
     config = AppConfig(
-        trading_mode=_as_choice(mode.get("trading_mode"), "trading_mode", {"PAPER", "LIVE"}),
-        underlying=_as_choice(market.get("underlying"), "underlying", set(UNDERLYING_SPECS)),
-        timeframe_minutes=_as_int(market.get("timeframe_minutes"), "timeframe_minutes"),
-        amplitude=_as_int(strategy.get("amplitude"), "amplitude"),
-        channel_deviation=_as_float(strategy.get("channel_deviation"), "channel_deviation"),
-        signal_confirmation=_as_choice(strategy.get("signal_confirmation"), "signal_confirmation", {"CANDLE_CLOSE"}),
-        exit_on_opposite_signal=_as_bool(strategy.get("exit_on_opposite_signal"), "exit_on_opposite_signal"),
+        trading_mode=_as_choice(root.get("trading_mode"), "trading_mode", {"PAPER", "LIVE", "BACKTEST"}),
+        underlying=_as_choice(root.get("underlying"), "underlying", set(UNDERLYING_SPECS)),
+        candle_mode=_as_choice(root.get("candle_mode"), "candle_mode", {"NORMAL", "RENKO"}),
+        timeframe_minutes=_as_int(root.get("timeframe_minutes"), "timeframe_minutes"),
+        polling_seconds=_as_int(root.get("polling_seconds"), "polling_seconds"),
+        amplitude=_as_int(halftrend.get("amplitude"), "halftrend.amplitude"),
+        channel_deviation=_as_float(halftrend.get("channel_deviation"), "halftrend.channel_deviation"),
+        sideways_filter_enabled=_as_bool(halftrend.get("sideways_filter_enabled"), "sideways_filter_enabled"),
+        sideways_lookback=_as_int(halftrend.get("sideways_lookback"), "sideways_lookback"),
+        sideways_tolerance_points=_as_float(halftrend.get("sideways_tolerance_points"), "sideways_tolerance_points"),
+        rsi_enabled=_as_bool(rsi.get("enabled"), "rsi.enabled"),
+        rsi_period=_as_int(rsi.get("period"), "rsi.period"),
+        rsi_bullish_min=_as_float(rsi.get("bullish_min"), "rsi.bullish_min"),
+        rsi_bearish_max=_as_float(rsi.get("bearish_max"), "rsi.bearish_max"),
+        renko_brick_size_points=_as_float(renko.get("brick_size_points"), "renko.brick_size_points"),
+        renko_entry_confirmation_bricks=_as_int(renko.get("entry_confirmation_bricks"), "entry_confirmation_bricks"),
+        renko_exit_confirmation_bricks=_as_int(renko.get("exit_confirmation_bricks"), "exit_confirmation_bricks"),
         expiry_mode=_as_choice(option.get("expiry_mode"), "expiry_mode", {"NEAREST", "CONFIGURED"}),
         expiry=expiry,
-        strike_mode=_as_choice(option.get("strike_mode"), "strike_mode", {"ATM", "ITM", "OTM"}),
+        selection_mode=_as_choice(option.get("selection_mode"), "selection_mode", {"ATM", "ITM", "OTM", "PREMIUM"}),
         strike_offset=_as_int(option.get("strike_offset"), "strike_offset"),
+        target_premium=_as_float(option.get("target_premium"), "target_premium"),
+        premium_tolerance=_as_float(option.get("premium_tolerance"), "premium_tolerance"),
         lots=_as_int(option.get("lots"), "lots"),
         order_type=_as_choice(execution.get("order_type"), "order_type", {"LIMIT", "MARKET"}),
         product_type=_as_choice(execution.get("product_type"), "product_type", {"INTRADAY", "MARGIN"}),
-        holding_mode=_as_choice(execution.get("holding_mode"), "holding_mode", {"INTRADAY", "SWING", "POSITIONAL"}),
+        tp_sl_mode=_as_choice(risk.get("tp_sl_mode"), "tp_sl_mode", {"UNDERLYING_POINTS", "OPTION_PREMIUM_POINTS"}),
         tp_enabled=_as_bool(take_profit.get("enabled"), "take_profit.enabled"),
-        tp_type=_as_choice(take_profit.get("type"), "take_profit.type", {"PERCENT", "ABSOLUTE"}),
-        tp_value=_as_float(take_profit.get("value"), "take_profit.value"),
+        tp_points=_as_float(take_profit.get("points"), "take_profit.points"),
         sl_enabled=_as_bool(stop_loss.get("enabled"), "stop_loss.enabled"),
-        sl_type=_as_choice(stop_loss.get("type"), "stop_loss.type", {"PERCENT", "ABSOLUTE"}),
-        sl_value=_as_float(stop_loss.get("value"), "stop_loss.value"),
+        sl_points=_as_float(stop_loss.get("points"), "stop_loss.points"),
+        stop_bot_after_tp_sl=_as_bool(risk.get("stop_bot_after_tp_sl"), "stop_bot_after_tp_sl"),
         max_open_strategies=_as_int(risk.get("max_open_strategies"), "max_open_strategies"),
         max_orders_per_day=_as_int(risk.get("max_orders_per_day"), "max_orders_per_day"),
         max_loss_per_day_inr=_as_float(risk.get("max_loss_per_day_inr"), "max_loss_per_day_inr"),
         no_reentry_after_stop_loss=_as_bool(risk.get("no_reentry_after_stop_loss"), "no_reentry_after_stop_loss"),
         no_reentry_after_max_loss=_as_bool(risk.get("no_reentry_after_max_loss"), "no_reentry_after_max_loss"),
-        session_enabled=_as_bool(session.get("enabled"), "session.enabled"),
-        timezone_name=str(session.get("timezone") or "").strip(),
-        run_mode=_as_choice(session.get("run_mode"), "run_mode", {"CONTINUOUS", "SCHEDULED"}),
-        start_time=str(session.get("start_time") or "").strip(),
-        stop_time=str(session.get("stop_time") or "").strip(),
-        close_all_positions_at_stop=_as_bool(session.get("close_all_positions_at_stop"), "close_all_positions_at_stop"),
-        stop_bot_after_close=_as_bool(session.get("stop_bot_after_close"), "stop_bot_after_close"),
-        polling_seconds=_as_int(runtime.get("polling_seconds"), "polling_seconds"),
-        post_close_polls=_as_int(runtime.get("post_close_polls"), "post_close_polls"),
-        post_close_poll_seconds=_as_int(runtime.get("post_close_poll_seconds"), "post_close_poll_seconds"),
+        exit_on_opposite_signal=_as_bool(risk.get("exit_on_opposite_signal"), "exit_on_opposite_signal"),
+        timezone_name=str(root.get("timezone") or "").strip(),
+        run_mode=_as_choice(root.get("run_mode"), "run_mode", {"CONTINUOUS", "SCHEDULED"}),
+        start_time=str(root.get("start_time") or "").strip(),
+        stop_time=str(root.get("stop_time") or "").strip(),
+        close_all_positions_at_stop=_as_bool(root.get("close_all_positions_at_stop"), "close_all_positions_at_stop"),
+        stop_bot_after_close=_as_bool(root.get("stop_bot_after_close"), "stop_bot_after_close"),
+        post_close_polls=_as_int(root.get("post_close_polls"), "post_close_polls"),
+        post_close_poll_seconds=_as_int(root.get("post_close_poll_seconds"), "post_close_poll_seconds"),
+        backtest_start_date=str(backtest.get("start_date") or "").strip(),
+        backtest_end_date=str(backtest.get("end_date") or "").strip(),
     )
     validate_config(config)
     return config
@@ -433,6 +515,7 @@ class Position:
     lot_size: int
     tick_size: float
     entry_price: float
+    underlying_entry: float
     product_type: str
     exchange_segment: str
     entry_time: datetime
@@ -474,11 +557,12 @@ class BotState:
     pending_exit_reason: str | None = None
     pending_tag: str | None = None
     last_signal: str | None = None
-    last_signal_candle: datetime | None = None
+    last_signal_bar: str | None = None
     last_confirmed_candle: datetime | None = None
-    last_evaluated_candle: datetime | None = None
+    last_evaluated_bar: str | None = None
+    bar_id: str | None = None
     deferred_signal: str | None = None
-    deferred_candle: datetime | None = None
+    deferred_bar: str | None = None
     last_option_contract: OptionContract | None = None
     stop_loss_hit: bool = False
     max_loss_hit: bool = False
@@ -488,6 +572,14 @@ class BotState:
     data_status: str = "OK"
     quote_failed: bool = False
     half_trend_value: float | None = None
+    rsi_value: float | None = None
+    rsi_filter: str = "DISABLED"
+    market_state: str = "WAITING"
+    entry_block_reason: str = ""
+    entry_confirm_count: int = 0
+    exit_confirm_count: int = 0
+    brick_state: str = "-"
+    ht_position: str = "-"
     signal_label: str = "NONE"
     signal_reason: str = "Waiting for a confirmed candle"
     underlying_ltp: float | None = None
@@ -499,6 +591,8 @@ class BotState:
     trades: list[TradeRecord] = field(default_factory=list)
     events: deque[str] = field(default_factory=lambda: deque(maxlen=8))
     candles: pd.DataFrame | None = None
+    minute_candles: pd.DataFrame | None = None
+    source_candle_time: datetime | None = None
     last_candle_fetch: datetime | None = None
     expiries: list[str] = field(default_factory=list)
     resolved_expiry: str = ""
@@ -516,7 +610,7 @@ class BotState:
     last_position_refresh: datetime | None = None
     last_quote_monotonic: float = 0.0
     shutting_down: bool = False
-    entry_skip_candle: datetime | None = None
+    entry_skip_bar: str | None = None
     shutdown_after_exit: str | None = None
     unsafe_to_close: bool = False
 
@@ -781,7 +875,8 @@ def resolve_underlying(master: pd.DataFrame, underlying: str) -> dict[str, str]:
             f"Could not resolve {underlying} from the security master "
             f"on {spec['index_exchange']}. No index row matched."
         )
-    exact = matches[trading == spec["preferred_symbol"]]
+    preferred = matches["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.strip()
+    exact = matches[preferred == spec["preferred_symbol"]]
     chosen = exact if not exact.empty else matches
     security_ids = chosen["SEM_SMST_SECURITY_ID"].astype(str).str.strip().unique().tolist()
     if len(security_ids) != 1:
@@ -918,6 +1013,15 @@ def _candles_from_payload(payload: Any) -> pd.DataFrame:
     return frame[columns].reset_index(drop=True)
 
 
+def bar_minutes() -> int:
+    """Return the source-candle size. Renko is built from 1-minute closes."""
+    if CONFIG is None:
+        return 1
+    if CONFIG.candle_mode == "RENKO":
+        return 1
+    return CONFIG.timeframe_minutes
+
+
 def fetch_underlying_candles(now: datetime | None = None) -> pd.DataFrame:
     """Download index candles and keep only confirmed, recent rows.
 
@@ -929,6 +1033,7 @@ def fetch_underlying_candles(now: datetime | None = None) -> pd.DataFrame:
 
     Output:
         OHLC frame in the configured timezone. The forming candle is removed.
+        Renko mode stores 1-minute closes. Normal mode stores the configured timeframe.
 
     Trading use:
         Signals come from this frame. A failed download leaves the previous
@@ -937,7 +1042,9 @@ def fetch_underlying_candles(now: datetime | None = None) -> pd.DataFrame:
     if BROKER is None or CONFIG is None:
         raise RuntimeError("Dhan and config must be ready before fetching candles")
     moment = now or now_in_tz()
-    start = (moment.date() - timedelta(days=10)).isoformat()
+    minutes = bar_minutes()
+    lookback_days = 12 if CONFIG.candle_mode == "RENKO" else 10
+    start = (moment.date() - timedelta(days=lookback_days)).isoformat()
     end = moment.date().isoformat()
     response = BROKER.dhan.intraday_minute_data(
         security_id=str(STATE.underlying_security_id),
@@ -945,48 +1052,60 @@ def fetch_underlying_candles(now: datetime | None = None) -> pd.DataFrame:
         instrument_type="INDEX",
         from_date=start,
         to_date=end,
-        interval=int(CONFIG.timeframe_minutes),
+        interval=int(minutes),
     )
     frame = _candles_from_payload(unwrap_sdk_data(response))
-    frame = drop_unconfirmed_candle(frame, moment)
-    keep = ATR_PERIOD + CONFIG.amplitude + 30
+    frame = drop_unconfirmed_candle(frame, moment, minutes)
+    if CONFIG.candle_mode == "RENKO":
+        keep = 1500
+    else:
+        keep = ATR_PERIOD + CONFIG.amplitude + CONFIG.rsi_period + CONFIG.sideways_lookback + 30
     if len(frame) > keep:
         frame = frame.iloc[-keep:].reset_index(drop=True)
-    STATE.candles = frame
+    if CONFIG.candle_mode == "RENKO":
+        STATE.minute_candles = frame
+    else:
+        STATE.candles = frame
     STATE.last_candle_fetch = moment
     if not frame.empty:
-        STATE.candle_time = frame.iloc[-1]["timestamp"]
-        STATE.last_confirmed_candle = STATE.candle_time
+        STATE.source_candle_time = frame.iloc[-1]["timestamp"]
+        if CONFIG.candle_mode != "RENKO":
+            STATE.candle_time = STATE.source_candle_time
+            STATE.last_confirmed_candle = STATE.candle_time
     return frame
 
 
-def drop_unconfirmed_candle(frame: pd.DataFrame, now: datetime) -> pd.DataFrame:
+def drop_unconfirmed_candle(frame: pd.DataFrame, now: datetime, minutes: int | None = None) -> pd.DataFrame:
     """Remove the candle that has not closed yet.
 
     Dhan timestamps are treated as the candle open. A 10:05 poll must not
     treat the 10:05 candle as confirmed when the timeframe is 5 minutes.
+    Renko uses the same rule on 1-minute candles.
     """
     if CONFIG is None or frame.empty:
         return frame
+    width = CONFIG.timeframe_minutes if minutes is None else minutes
     last_open = frame.iloc[-1]["timestamp"]
     if last_open.tzinfo is None:
         last_open = last_open.replace(tzinfo=CONFIG.timezone)
-    if last_open + timedelta(minutes=CONFIG.timeframe_minutes) > now:
+    if last_open + timedelta(minutes=width) > now:
         return frame.iloc[:-1].reset_index(drop=True)
     return frame.reset_index(drop=True)
 
 
 def candles_need_refresh(now: datetime) -> bool:
-    """True when a new confirmed candle should exist or no candles are loaded.
+    """True when a new confirmed source candle should exist or none are loaded.
 
     History is not fetched on every poll. After a candle is due, retries are
-    spaced out so a slow API cannot be hammered.
+    spaced out so a slow API cannot be hammered. Renko watches the 1-minute
+    clock, not the 5-minute clock.
     """
     if CONFIG is None:
         return False
-    if STATE.candles is None or STATE.last_candle_fetch is None or STATE.candle_time is None:
+    source = STATE.minute_candles if CONFIG.candle_mode == "RENKO" else STATE.candles
+    if source is None or STATE.last_candle_fetch is None or STATE.source_candle_time is None:
         return True
-    due_at = STATE.candle_time + timedelta(minutes=CONFIG.timeframe_minutes)
+    due_at = STATE.source_candle_time + timedelta(minutes=bar_minutes())
     if now < due_at:
         return False
     return (now - STATE.last_candle_fetch) >= timedelta(seconds=max(20, CONFIG.polling_seconds))
@@ -1030,7 +1149,8 @@ def fetch_ltp(security_id: str, exchange_segment: str) -> float | None:
         Positive price, or None when the quote has no usable price.
 
     Trading use:
-        Option TP/SL uses this premium, not the index price.
+        Underlying-point targets use the index price. Premium-point targets
+        use this option price. A missing quote does not count as a hit.
     """
     prices = fetch_quotes({exchange_segment: [str(security_id)]})
     return prices.get(str(security_id))
@@ -1148,6 +1268,11 @@ def _normalize_option_chain(payload: Any) -> tuple[float, list[dict[str, Any]]]:
     """Convert Dhan's strike-keyed chain into simple CE/PE rows."""
     if not isinstance(payload, dict):
         raise RuntimeError("Option chain response was not an object")
+    nested = payload.get("data")
+    if "last_price" not in payload and isinstance(nested, dict) and (
+        "last_price" in nested or "oc" in nested
+    ):
+        payload = nested
     spot = positive_float(payload.get("last_price"))
     if spot is None:
         raise RuntimeError("Option chain did not include the underlying price")
@@ -1226,13 +1351,13 @@ def select_option_contract(
     strike_mode: str,
     strike_offset: int,
 ) -> OptionContract:
-    """Choose CE or PE from listed strikes.
+    """Choose CE or PE from listed strikes or from a target premium.
 
     Purpose:
         Map a bullish signal to a call and a bearish signal to a put.
 
     Inputs:
-        Normalized chain, spot, CE/PE, ATM/ITM/OTM, and the strike step count.
+        Normalized chain, spot, CE/PE, ATM/ITM/OTM/PREMIUM, and the strike step count.
 
     Output:
         OptionContract enriched from the security master.
@@ -1240,8 +1365,13 @@ def select_option_contract(
     Trading use:
         ATM is the nearest listed strike that has the requested side. ITM and
         OTM move by real chain steps, not by a hardcoded point interval.
-        Offset 0 on ITM/OTM means one step. The chosen id must exist in the master.
+        Offset 0 on ITM/OTM means one step. PREMIUM picks the side whose LTP
+        is closest to target_premium and still inside premium_tolerance.
+        No premium match raises PremiumMatchError and does not order.
+        The chosen id must exist in the master.
     """
+    if strike_mode == "PREMIUM":
+        return _select_by_premium(rows, spot, option_type)
     side = option_type.lower()
     usable = [row for row in rows if row.get(f"{side}_security_id")]
     if not usable:
@@ -1261,6 +1391,58 @@ def select_option_contract(
     if chosen_index < 0 or chosen_index >= len(usable):
         raise RuntimeError("Requested strike is outside the available option chain")
     chosen = usable[chosen_index]
+    security_id = str(chosen[f"{side}_security_id"])
+    return resolve_option_contract(security_id, chosen, option_type)
+
+
+class PremiumMatchError(RuntimeError):
+    """Raised when no option premium is close enough to the configured target."""
+
+
+def _select_by_premium(
+    rows: list[dict[str, Any]],
+    spot: float,
+    option_type: str,
+) -> OptionContract:
+    """Pick the CE or PE whose premium is closest to the configured target.
+
+    Purpose:
+        Let the trader ask for a premium near a rupee amount instead of a strike step.
+
+    Inputs:
+        Chain rows, spot, and CE or PE.
+
+    Output:
+        The closest contract inside the tolerance.
+
+    Trading use:
+        An exact premium is not required. If nothing is inside the tolerance,
+        the caller must not send an order.
+    """
+    if CONFIG is None:
+        raise RuntimeError("Config is not loaded")
+    side = option_type.lower()
+    target = CONFIG.target_premium
+    tolerance = CONFIG.premium_tolerance
+    candidates: list[tuple[float, float, dict[str, Any]]] = []
+    for row in rows:
+        if not row.get(f"{side}_security_id"):
+            continue
+        premium = positive_float(row.get(f"{side}_ltp"))
+        if premium is None:
+            continue
+        distance = abs(premium - target)
+        if distance <= tolerance:
+            candidates.append((distance, abs(float(row["strike"]) - spot), row))
+    if not candidates:
+        print("NO PREMIUM MATCH")
+        print(f"TARGET: ₹{target:g}")
+        print(f"TOLERANCE: ₹{tolerance:g}")
+        raise PremiumMatchError(
+            f"NO PREMIUM MATCH target ₹{target:g} tolerance ₹{tolerance:g}"
+        )
+    candidates.sort(key=lambda item: (item[0], item[1], float(item[2]["strike"])))
+    chosen = candidates[0][2]
     security_id = str(chosen[f"{side}_security_id"])
     return resolve_option_contract(security_id, chosen, option_type)
 
@@ -1467,85 +1649,296 @@ def calculate_half_trend(
     return data
 
 
-def generate_signal(candles: pd.DataFrame) -> str | None:
-    """Return BUY_CE, BUY_PE, or None from the last two confirmed candles.
+def calculate_rsi(closes: pd.Series, period: int) -> pd.Series:
+    """Calculate Wilder RSI from closes.
 
     Purpose:
-        Turn a close crossing the Half Trend line into an option-buying signal.
+        Provide the optional entry filter without TA-Lib.
+
+    Inputs:
+        Close prices and the RSI period.
+
+    Output:
+        A series aligned to the closes. Early rows are NaN until the period exists.
+
+    Trading use:
+        A bullish entry needs RSI at or above bullish_min. A bearish entry needs
+        RSI at or below bearish_max. Disabled RSI is not calculated into the decision.
+
+    Important:
+        Each value uses only that close and older closes.
+    """
+    result = pd.Series(float("nan"), index=closes.index, dtype=float)
+    if period < 2 or len(closes) <= period:
+        return result
+    delta = closes.astype(float).diff()
+    gain = delta.clip(lower=0.0).fillna(0.0)
+    loss = (-delta.clip(upper=0.0)).fillna(0.0)
+    avg_gain = float(gain.iloc[1 : period + 1].mean())
+    avg_loss = float(loss.iloc[1 : period + 1].mean())
+    result.iloc[period] = 100.0 if avg_loss == 0 else 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+    for index in range(period + 1, len(closes)):
+        avg_gain = ((avg_gain * (period - 1)) + float(gain.iloc[index])) / period
+        avg_loss = ((avg_loss * (period - 1)) + float(loss.iloc[index])) / period
+        if avg_loss == 0:
+            result.iloc[index] = 100.0
+        else:
+            result.iloc[index] = 100.0 - (100.0 / (1.0 + (avg_gain / avg_loss)))
+    return result
+
+
+def detect_sideways_market(half_trend: pd.Series) -> bool:
+    """True when the Half Trend line is flat across the configured lookback.
+
+    Purpose:
+        Block new entries when the line is not moving.
+
+    Inputs:
+        Half Trend values in time order.
+
+    Output:
+        True when max(line) - min(line) is within sideways_tolerance_points.
+        Also True when the filter is on and there are not enough values yet.
+
+    Trading use:
+        The same test is used for normal candles and Renko bricks. It does not
+        close an open option by itself.
+    """
+    if CONFIG is None or not CONFIG.sideways_filter_enabled:
+        return False
+    lookback = CONFIG.sideways_lookback
+    if len(half_trend) < lookback:
+        return True
+    window = half_trend.iloc[-lookback:].astype(float)
+    if window.isna().any():
+        return True
+    return float(window.max() - window.min()) <= CONFIG.sideways_tolerance_points
+
+
+def build_renko(frame: pd.DataFrame, brick_size: float) -> pd.DataFrame:
+    """Build completed Renko bricks from underlying closes.
+
+    Purpose:
+        Turn 1-minute index closes into bricks before Half Trend is calculated.
+
+    Inputs:
+        A time-ordered OHLC frame and the brick size in index points.
+
+    Output:
+        One row per completed brick: timestamp, open, high, low, close.
+        Several bricks can share a source timestamp after a large jump.
+
+    Trading use:
+        A poll does not create a brick. Continuation needs one brick. A reversal
+        needs two bricks. The algorithm uses closes only, so it does not invent
+        an intrabar path.
+
+    Important:
+        Brick i uses only closes at or before its source timestamp.
+    """
+    columns = ["timestamp", "open", "high", "low", "close"]
+    empty = pd.DataFrame(columns=columns)
+    if frame is None or frame.empty or brick_size <= 0 or len(frame) < 2:
+        return empty
+    last_close = float(frame.iloc[0]["close"])
+    direction = 0
+    rows: list[dict[str, Any]] = []
+    for index in range(1, len(frame)):
+        price = float(frame.iloc[index]["close"])
+        timestamp = frame.iloc[index]["timestamp"]
+        while True:
+            if direction >= 0 and price >= last_close + brick_size:
+                brick_open = last_close
+                brick_close = last_close + brick_size
+                direction = 1
+            elif direction <= 0 and price <= last_close - brick_size:
+                brick_open = last_close
+                brick_close = last_close - brick_size
+                direction = -1
+            elif direction == 1 and price <= last_close - (2 * brick_size):
+                brick_open = last_close - brick_size
+                brick_close = last_close - (2 * brick_size)
+                direction = -1
+            elif direction == -1 and price >= last_close + (2 * brick_size):
+                brick_open = last_close + brick_size
+                brick_close = last_close + (2 * brick_size)
+                direction = 1
+            else:
+                break
+            rows.append(
+                {
+                    "timestamp": timestamp,
+                    "open": brick_open,
+                    "high": max(brick_open, brick_close),
+                    "low": min(brick_open, brick_close),
+                    "close": brick_close,
+                }
+            )
+            last_close = brick_close
+    if not rows:
+        return empty
+    return pd.DataFrame(rows, columns=columns)
+
+
+def generate_normal_signal(candles: pd.DataFrame) -> str | None:
+    """Return BUY_CE or BUY_PE when the latest confirmed close is off the line.
+
+    Purpose:
+        Turn one confirmed close into an option-buying direction.
 
     Inputs:
         Frame that already contains close and half_trend.
 
     Output:
-        BUY_CE when price crosses above the line.
-        BUY_PE when price crosses below the line.
-        None when there is no new cross.
+        BUY_CE when the close is above Half Trend.
+        BUY_PE when the close is below Half Trend.
+        None when the close equals the line or the line is not ready.
 
     Trading use:
-        The caller must run this only for a new confirmed candle. Staying above
-        the line is not another buy. The bot buys options; it does not buy the index.
+        The caller must run this only for a new confirmed candle. An open
+        position blocks another buy. This is not a two-candle cross.
     """
-    if candles is None or len(candles) < 2:
+    if candles is None or candles.empty or "half_trend" not in candles.columns:
         return None
-    if "half_trend" not in candles.columns:
+    close = float(candles.iloc[-1]["close"])
+    line = float(candles.iloc[-1]["half_trend"])
+    if math.isnan(close) or math.isnan(line):
         return None
-    previous = candles.iloc[-2]
-    current = candles.iloc[-1]
-    values = [
-        float(previous["close"]),
-        float(previous["half_trend"]),
-        float(current["close"]),
-        float(current["half_trend"]),
-    ]
-    if any(math.isnan(value) for value in values):
-        return None
-    previous_close, previous_line, close, line = values
-    if previous_close <= previous_line and close > line:
+    if close > line:
         return "BUY_CE"
-    if previous_close >= previous_line and close < line:
+    if close < line:
         return "BUY_PE"
     return None
 
 
+def generate_signal(candles: pd.DataFrame) -> str | None:
+    """Direction of the latest confirmed close versus Half Trend."""
+    return generate_normal_signal(candles)
+
+
+def _brick_qualifies(row: pd.Series, side: str) -> bool:
+    """True when a completed brick has the required direction and line side."""
+    close = float(row["close"])
+    brick_open = float(row["open"])
+    line = float(row["half_trend"])
+    if any(math.isnan(value) for value in (close, brick_open, line)):
+        return False
+    if side == "CE":
+        return close > brick_open and close > line
+    return close < brick_open and close < line
+
+
+def _trailing_brick_count(candles: pd.DataFrame, side: str) -> int:
+    """Count consecutive qualifying bricks at the end of the Renko series."""
+    count = 0
+    for _, row in candles.iloc[::-1].iterrows():
+        if _brick_qualifies(row, side):
+            count += 1
+        else:
+            break
+    return count
+
+
+def generate_renko_signal(candles: pd.DataFrame) -> str | None:
+    """Return a Renko entry only after enough consecutive qualifying bricks.
+
+    Purpose:
+        Require the configured confirmation count before a Renko entry.
+
+    Inputs:
+        Completed Renko bricks that already contain Half Trend.
+
+    Output:
+        BUY_CE, BUY_PE, or None.
+
+    Trading use:
+        One brick is the default. The same brick is not traded twice because
+        the caller tracks the brick identity.
+    """
+    if CONFIG is None or candles is None or candles.empty or "half_trend" not in candles.columns:
+        return None
+    needed = CONFIG.renko_entry_confirmation_bricks
+    bullish = _trailing_brick_count(candles, "CE")
+    bearish = _trailing_brick_count(candles, "PE")
+    STATE.entry_confirm_count = max(bullish, bearish)
+    if bullish >= needed:
+        return "BUY_CE"
+    if bearish >= needed:
+        return "BUY_PE"
+    return None
+
+
+def renko_exit_ready(candles: pd.DataFrame, option_type: str) -> bool:
+    """True when enough Renko bricks have closed on the wrong side of Half Trend.
+
+    Purpose:
+        Exit a call after consecutive bricks below the line, and a put after
+        consecutive bricks above the line.
+
+    Inputs:
+        Completed bricks and CE or PE.
+
+    Output:
+        True when the trailing count reaches exit_confirmation_bricks.
+
+    Trading use:
+        An incomplete brick cannot increment the count. A brick that is not
+        on the wrong side resets the trailing count.
+    """
+    if CONFIG is None or candles is None or candles.empty:
+        STATE.exit_confirm_count = 0
+        return False
+    count = 0
+    for _, row in candles.iloc[::-1].iterrows():
+        close = float(row["close"])
+        line = float(row["half_trend"])
+        if math.isnan(close) or math.isnan(line):
+            break
+        opposite = (option_type == "CE" and close < line) or (option_type == "PE" and close > line)
+        if opposite:
+            count += 1
+        else:
+            break
+    STATE.exit_confirm_count = count
+    return count >= CONFIG.renko_exit_confirmation_bricks
+
+
 def describe_candle_side(candles: pd.DataFrame) -> str:
-    """Explain the latest close versus the line, including a non-cross."""
-    signal = generate_signal(candles)
+    """Explain the latest close versus the line."""
+    signal = generate_normal_signal(candles)
     if signal == "BUY_CE":
-        return "Confirmed close crossed above Half Trend"
+        return "Confirmed close is above Half Trend"
     if signal == "BUY_PE":
-        return "Confirmed close crossed below Half Trend"
+        return "Confirmed close is below Half Trend"
     if candles is None or candles.empty or "half_trend" not in candles.columns:
         return "Half Trend is not ready"
     close = float(candles.iloc[-1]["close"])
     line = float(candles.iloc[-1]["half_trend"])
     if math.isnan(close) or math.isnan(line):
         return "Half Trend is not ready"
-    if close > line:
-        return "Close is above Half Trend without a new cross"
-    if close < line:
-        return "Close is below Half Trend without a new cross"
     return "Close equals Half Trend"
 
 
-def is_new_confirmed_candle(candle_timestamp: datetime | None = None) -> bool:
-    """True when this confirmed candle has not been evaluated yet.
+def is_new_confirmed_candle(bar_id: str | None = None) -> bool:
+    """True when this confirmed bar has not been evaluated yet.
 
     Purpose:
-        Separate the 5-second poll from the 5-minute signal.
+        Separate the 5-second poll from a new candle or Renko brick.
 
     Inputs:
-        Candle open time. When omitted, the state's latest candle is used.
+        Bar identity. When omitted, the state's latest bar id is used.
 
     Output:
-        False for the same timestamp that was already evaluated.
+        False for the same bar that was already evaluated.
 
     Trading use:
         Prevents one bullish candle from buying a call on every poll.
+        Renko bricks that share a source timestamp still have different ids.
     """
-    timestamp = STATE.candle_time if candle_timestamp is None else candle_timestamp
-    if timestamp is None:
+    identity = STATE.bar_id if bar_id is None else bar_id
+    if identity is None:
         return False
-    return timestamp != STATE.last_evaluated_candle
+    return identity != STATE.last_evaluated_bar
 
 
 # ============================================================
@@ -1577,86 +1970,215 @@ def next_order_tag(kind: str) -> str:
     return f"{ALGO_TAG_PREFIX}{kind}{STATE.trading_date.strftime('%y%m%d')}{sequence:02d}"
 
 
+def _series_bar_id(frame: pd.DataFrame) -> str:
+    """Identity of the latest bar. Renko includes the row count so shared timestamps stay unique."""
+    timestamp = frame.iloc[-1]["timestamp"]
+    stamp = timestamp.isoformat() if isinstance(timestamp, datetime) else str(timestamp)
+    close = float(frame.iloc[-1]["close"])
+    return f"{stamp}|{len(frame)}|{close:.4f}"
+
+
+def _refresh_filters(frame: pd.DataFrame) -> None:
+    """Store RSI, sideways state, and the latest line for the dashboard."""
+    if CONFIG is None or frame.empty:
+        return
+    last = frame.iloc[-1]
+    line = float(last["half_trend"])
+    STATE.half_trend_value = None if math.isnan(line) else line
+    close = float(last["close"])
+    if CONFIG.candle_mode == "RENKO":
+        STATE.brick_state = "BULLISH" if close > float(last["open"]) else "BEARISH" if close < float(last["open"]) else "FLAT"
+    if STATE.half_trend_value is None:
+        STATE.ht_position = "-"
+    elif close > line:
+        STATE.ht_position = "ABOVE"
+    elif close < line:
+        STATE.ht_position = "BELOW"
+    else:
+        STATE.ht_position = "EQUAL"
+    rsi = float(last["rsi"]) if "rsi" in frame.columns else float("nan")
+    STATE.rsi_value = None if math.isnan(rsi) else rsi
+    if not CONFIG.sideways_filter_enabled:
+        STATE.market_state = "FILTER OFF"
+    elif len(frame) < CONFIG.sideways_lookback or frame["half_trend"].iloc[-CONFIG.sideways_lookback :].isna().any():
+        STATE.market_state = "WAITING"
+    elif detect_sideways_market(frame["half_trend"]):
+        STATE.market_state = "SIDEWAYS"
+    else:
+        STATE.market_state = "TRENDING"
+    direction = generate_normal_signal(frame)
+    if not CONFIG.rsi_enabled:
+        STATE.rsi_filter = "DISABLED"
+    elif STATE.rsi_value is None:
+        STATE.rsi_filter = "WAITING"
+    elif direction == "BUY_CE":
+        STATE.rsi_filter = "PASS" if STATE.rsi_value >= CONFIG.rsi_bullish_min else "FAIL"
+    elif direction == "BUY_PE":
+        STATE.rsi_filter = "PASS" if STATE.rsi_value <= CONFIG.rsi_bearish_max else "FAIL"
+    else:
+        STATE.rsi_filter = "WAITING"
+
+
+def entry_filters_pass(direction: str | None) -> bool:
+    """True when sideways and RSI allow this direction to become an entry.
+
+    Purpose:
+        Keep one filter path for normal candles and Renko.
+
+    Inputs:
+        BUY_CE, BUY_PE, or None.
+
+    Output:
+        False when the direction is missing, the line is flat, or RSI fails.
+
+    Trading use:
+        A failed filter blocks the entry and writes the dashboard reason.
+        It does not by itself close an open option.
+    """
+    STATE.entry_block_reason = ""
+    if direction is None or CONFIG is None:
+        return False
+    if STATE.market_state in {"SIDEWAYS", "WAITING"} and CONFIG.sideways_filter_enabled:
+        if STATE.market_state == "SIDEWAYS":
+            STATE.entry_block_reason = "ENTRY BLOCKED: HALF TREND SIDEWAYS"
+        else:
+            STATE.entry_block_reason = "ENTRY BLOCKED: HALF TREND NOT READY"
+        return False
+    if CONFIG.rsi_enabled and STATE.rsi_filter != "PASS":
+        if STATE.rsi_filter == "WAITING":
+            STATE.entry_block_reason = "ENTRY BLOCKED: RSI NOT READY"
+        else:
+            STATE.entry_block_reason = "ENTRY BLOCKED: RSI FILTER FAILED"
+        return False
+    return True
+
+
 def refresh_indicator(now: datetime) -> None:
-    """Recalculate Half Trend when a new candle is due."""
+    """Recalculate Half Trend, RSI, and Renko when a new source candle is due.
+
+    Purpose:
+        Keep the signal series current without downloading history every poll.
+
+    Inputs:
+        Current exchange time.
+
+    Output:
+        None. Updates STATE.candles and the dashboard fields.
+
+    Trading use:
+        Normal mode calculates Half Trend on confirmed OHLC candles.
+        Renko mode builds bricks from 1-minute closes and calculates Half Trend
+        on those bricks only.
+    """
     if CONFIG is None:
         return
     if candles_need_refresh(now):
         fetch_underlying_candles(now)
-    if STATE.candles is None or STATE.candles.empty:
+    source = STATE.minute_candles if CONFIG.candle_mode == "RENKO" else STATE.candles
+    if source is None or source.empty:
         STATE.half_trend_value = None
         STATE.signal_reason = "No confirmed candles yet"
         return
-    calculated = calculate_half_trend(
-        STATE.candles,
-        CONFIG.amplitude,
-        CONFIG.channel_deviation,
-    )
+    if CONFIG.candle_mode == "RENKO":
+        bricks = build_renko(source, CONFIG.renko_brick_size_points)
+        if bricks.empty:
+            STATE.candles = bricks
+            STATE.half_trend_value = None
+            STATE.signal_reason = "No completed Renko brick yet"
+            STATE.bar_id = None
+            return
+        series = bricks
+    else:
+        series = source
+    calculated = calculate_half_trend(series, CONFIG.amplitude, CONFIG.channel_deviation)
+    calculated["rsi"] = calculate_rsi(calculated["close"], CONFIG.rsi_period)
     STATE.candles = calculated
-    STATE.half_trend_value = float(calculated.iloc[-1]["half_trend"])
     STATE.candle_time = calculated.iloc[-1]["timestamp"]
     STATE.last_confirmed_candle = STATE.candle_time
+    STATE.bar_id = _series_bar_id(calculated)
+    _refresh_filters(calculated)
 
 
-def consider_entry(signal: str, candle_time: datetime) -> None:
+def consider_entry(signal: str, bar_id: str) -> None:
     """Enter once for a fresh signal, or remember it when the block is temporary."""
-    if STATE.last_signal_candle == candle_time or STATE.entry_skip_candle == candle_time:
+    if STATE.last_signal_bar == bar_id or STATE.entry_skip_bar == bar_id:
         return
     allowed, reason = validate_entry(signal)
     if not allowed:
         note(f"Entry skipped: {reason}")
+        STATE.entry_block_reason = f"ENTRY BLOCKED: {reason}"
         if reason in RETRYABLE_ENTRY_BLOCKS:
             STATE.deferred_signal = signal
-            STATE.deferred_candle = candle_time
+            STATE.deferred_bar = bar_id
         else:
-            STATE.last_signal_candle = candle_time
+            STATE.last_signal_bar = bar_id
             STATE.deferred_signal = None
         return
     STATE.deferred_signal = None
-    place_entry_order(signal, candle_time)
-    STATE.last_signal_candle = candle_time
+    place_entry_order(signal, bar_id)
+    STATE.last_signal_bar = bar_id
 
 
 def process_signal() -> None:
-    """Evaluate a new confirmed candle and maybe enter or exit on the opposite side.
+    """Evaluate a new confirmed bar and maybe enter or exit on the opposite side.
 
     An opposite-signal exit does not reverse in the same cycle. A deferred
-    signal from earlier in the same candle can still enter once the block clears.
+    signal from earlier in the same bar can still enter once the block clears.
+    Normal mode uses one close versus Half Trend. Renko mode uses the configured
+    brick counts for entry and for the opposite exit.
     """
-    if CONFIG is None or STATE.candles is None or STATE.candle_time is None:
+    if CONFIG is None or STATE.candles is None or STATE.bar_id is None:
         return
-    candle_time = STATE.candle_time
-    if STATE.deferred_candle is not None and STATE.deferred_candle != candle_time:
+    bar_id = STATE.bar_id
+    if STATE.deferred_bar is not None and STATE.deferred_bar != bar_id:
         STATE.deferred_signal = None
-        STATE.deferred_candle = None
-    if is_new_confirmed_candle(candle_time):
-        STATE.last_evaluated_candle = candle_time
-        signal = generate_signal(STATE.candles)
-        STATE.signal_reason = describe_candle_side(STATE.candles)
-        STATE.signal_label = signal_label(signal)
-        if signal is not None:
-            STATE.last_signal = signal
-        if (
-            signal is not None
-            and STATE.data_status == "OK"
-            and CONFIG.exit_on_opposite_signal
-            and check_opposite_signal(signal)
-        ):
+        STATE.deferred_bar = None
+    if is_new_confirmed_candle(bar_id):
+        STATE.last_evaluated_bar = bar_id
+        _refresh_filters(STATE.candles)
+        if CONFIG.candle_mode == "RENKO":
+            direction = generate_renko_signal(STATE.candles)
+            position = get_current_position()
+            if position is not None:
+                renko_exit_ready(STATE.candles, position.option_type)
+            STATE.signal_reason = describe_candle_side(STATE.candles)
+            if direction is None and STATE.entry_block_reason == "":
+                needed = CONFIG.renko_entry_confirmation_bricks
+                STATE.signal_reason = f"Renko confirmation {STATE.entry_confirm_count}/{needed}"
+        else:
+            direction = generate_normal_signal(STATE.candles)
+            STATE.entry_confirm_count = 1 if direction else 0
+            STATE.signal_reason = describe_candle_side(STATE.candles)
+        filtered = direction if entry_filters_pass(direction) else None
+        if STATE.entry_block_reason:
+            STATE.signal_reason = STATE.entry_block_reason
+        STATE.signal_label = signal_label(filtered or direction)
+        if direction is not None:
+            STATE.last_signal = direction
+        opposite = False
+        if STATE.data_status == "OK" and CONFIG.exit_on_opposite_signal:
+            if CONFIG.candle_mode == "RENKO":
+                position = get_current_position()
+                opposite = position is not None and renko_exit_ready(STATE.candles, position.option_type)
+            else:
+                opposite = direction is not None and check_opposite_signal(direction)
+        if opposite:
             close_current_position("OPPOSITE_SIGNAL")
-            STATE.entry_skip_candle = candle_time
-            STATE.last_signal_candle = candle_time
+            STATE.entry_skip_bar = bar_id
+            STATE.last_signal_bar = bar_id
+            STATE.signal_reason = "EXIT: OPPOSITE SIGNAL"
             return
-        if signal is not None and STATE.status == "FLAT":
-            consider_entry(signal, candle_time)
+        if filtered is not None and STATE.status == "FLAT":
+            consider_entry(filtered, bar_id)
             return
     if (
         STATE.status == "FLAT"
         and STATE.deferred_signal is not None
-        and STATE.deferred_candle == candle_time
-        and STATE.last_signal_candle != candle_time
-        and STATE.entry_skip_candle != candle_time
+        and STATE.deferred_bar == bar_id
+        and STATE.last_signal_bar != bar_id
+        and STATE.entry_skip_bar != bar_id
     ):
-        consider_entry(STATE.deferred_signal, candle_time)
+        consider_entry(STATE.deferred_signal, bar_id)
 
 
 # ============================================================
@@ -1689,27 +2211,9 @@ def paper_enter(contract: OptionContract, signal: str, price: float) -> Position
     if STATE.status != "FLAT" or STATE.position is not None:
         raise RuntimeError("Paper entry refused because the bot is not flat")
     quantity = order_quantity(contract)
-    tp_price, sl_price = calculate_tp_sl(price, contract.tick_size)
     filled_at = now_in_tz()
-    position = Position(
-        security_id=contract.security_id,
-        trading_symbol=contract.trading_symbol,
-        option_type=contract.option_type,
-        strike=contract.strike,
-        expiry=contract.expiry,
-        quantity=quantity,
-        lot_size=contract.lot_size,
-        tick_size=contract.tick_size,
-        entry_price=price,
-        product_type=CONFIG.product_type if CONFIG else "INTRADAY",
-        exchange_segment=contract.exchange_segment,
-        entry_time=filled_at,
-        order_id="PAPER",
-        order_tag=next_order_tag("E"),
-        signal=signal,
-        tp_price=tp_price,
-        sl_price=sl_price,
-    )
+    position = build_position(contract, signal, price, quantity, "PAPER", next_order_tag("E"))
+    position.entry_time = filled_at
     STATE.position = position
     STATE.last_option_contract = contract
     STATE.option_ltp = price
@@ -1790,9 +2294,11 @@ def build_order_preview(
         f"PRODUCT TYPE:  {CONFIG.product_type}",
         f"PRICE:         {format_inr(price) if CONFIG.order_type == 'LIMIT' else 'MARKET / MPP'}",
         f"REASON:        {reason}",
-        f"CURRENT LTP:   {format_inr(contract.ltp or STATE.option_ltp)}",
-        f"TP:            {format_inr(tp_price)}",
-        f"SL:            {format_inr(sl_price)}",
+        f"CURRENT OPTION LTP: {format_inr(contract.ltp or STATE.option_ltp)}",
+        f"UNDERLYING LTP: {format_number(STATE.underlying_ltp)}",
+        f"TP:            {format_number(tp_price) if CONFIG.tp_sl_mode == 'UNDERLYING_POINTS' else format_inr(tp_price)}",
+        f"SL:            {format_number(sl_price) if CONFIG.tp_sl_mode == 'UNDERLYING_POINTS' else format_inr(sl_price)}",
+        f"TP/SL MODE:    {CONFIG.tp_sl_mode}",
     ]
     if notional:
         lines.append(f"NOTIONAL:      {format_inr(notional)}")
@@ -1857,9 +2363,15 @@ def live_enter(contract: OptionContract, signal: str, price: float) -> None:
     if STATE.status != "FLAT" or STATE.position is not None or STATE.pending_order_id:
         raise RuntimeError("Live entry refused because another order or position is active")
     quantity = order_quantity(contract)
-    tp_price, sl_price = calculate_tp_sl(price if price > 0 else (contract.ltp or price), contract.tick_size)
+    reference = price if price > 0 else (contract.ltp or price)
+    preview_tp, preview_sl = calculate_tp_sl(
+        reference,
+        STATE.underlying_ltp or 0.0,
+        contract.option_type,
+        contract.tick_size,
+    )
     tag = next_order_tag("E")
-    preview = build_order_preview(contract, "BUY", quantity, price, signal, tp_price, sl_price)
+    preview = build_order_preview(contract, "BUY", quantity, price, signal, preview_tp, preview_sl)
     print(preview)
     for line in preview.splitlines():
         STATE.events.appendleft(line)
@@ -2156,25 +2668,13 @@ def _finalize_live_entry(response: Any) -> None:
         raise RuntimeError("Traded entry has no selected contract")
     fallback = contract.ltp or STATE.underlying_ltp or 0.0
     fill = parse_fill_price(response, float(fallback))
-    tp_price, sl_price = calculate_tp_sl(fill, contract.tick_size)
-    position = Position(
-        security_id=contract.security_id,
-        trading_symbol=contract.trading_symbol,
-        option_type=contract.option_type,
-        strike=contract.strike,
-        expiry=contract.expiry,
-        quantity=order_quantity(contract),
-        lot_size=contract.lot_size,
-        tick_size=contract.tick_size,
-        entry_price=fill,
-        product_type=CONFIG.product_type,
-        exchange_segment=contract.exchange_segment,
-        entry_time=now_in_tz(),
-        order_id=STATE.pending_order_id or "",
-        order_tag=STATE.pending_tag or "",
-        signal=STATE.last_signal or "",
-        tp_price=tp_price,
-        sl_price=sl_price,
+    position = build_position(
+        contract,
+        STATE.last_signal or ("BUY_CE" if contract.option_type == "CE" else "BUY_PE"),
+        fill,
+        order_quantity(contract),
+        STATE.pending_order_id or "",
+        STATE.pending_tag or "",
     )
     STATE.position = position
     STATE.option_ltp = fill
@@ -2307,26 +2807,15 @@ def reconcile_live_positions() -> None:
     quantity = _row_quantity(row)
     if quantity % contract.lot_size != 0:
         raise RuntimeError("Existing position quantity is not a multiple of the lot size")
-    tp_price, sl_price = calculate_tp_sl(entry, contract.tick_size)
     print("EXISTING LIVE POSITION DETECTED")
-    STATE.position = Position(
-        security_id=contract.security_id,
-        trading_symbol=contract.trading_symbol,
-        option_type=contract.option_type,
-        strike=contract.strike,
-        expiry=contract.expiry,
-        quantity=quantity,
-        lot_size=contract.lot_size,
-        tick_size=contract.tick_size,
-        entry_price=entry,
-        product_type=CONFIG.product_type,
-        exchange_segment=contract.exchange_segment,
-        entry_time=now_in_tz(),
-        order_id="RESTORED",
-        order_tag=ALGO_TAG_PREFIX,
-        signal="BUY_CE" if option_type == "CE" else "BUY_PE",
-        tp_price=tp_price,
-        sl_price=sl_price,
+    note("Restored index TP/SL uses the current underlying price because the original index entry was not stored.")
+    STATE.position = build_position(
+        contract,
+        "BUY_CE" if option_type == "CE" else "BUY_PE",
+        entry,
+        quantity,
+        "RESTORED",
+        ALGO_TAG_PREFIX,
     )
     STATE.status = "LONG_OPTION"
     STATE.last_option_contract = contract
@@ -2413,43 +2902,102 @@ def calculate_combined_algo_pnl() -> float:
     return STATE.realized_pnl + STATE.unrealized_pnl
 
 
-def calculate_tp_sl(entry_price: float, tick_size: float) -> tuple[float | None, float | None]:
-    """Turn the configured TP and SL into premium prices.
+def calculate_tp_sl(
+    entry_premium: float,
+    underlying_price: float,
+    option_type: str,
+    tick_size: float,
+) -> tuple[float | None, float | None]:
+    """Turn configured points into a take-profit level and a stop-loss level.
 
     Purpose:
-        Keep targets on the option premium.
+        Keep the default target on the underlying index, with an optional premium mode.
 
     Inputs:
-        Fill price and the contract tick size.
+        Option fill, index price at entry, CE or PE, and the option tick size.
 
     Output:
-        (take-profit price or None, stop-loss price or None), rounded to the tick.
+        (take-profit level or None, stop-loss level or None).
 
     Trading use:
-        Percent 20 on a ₹100 premium is ₹120. Percent 10 is ₹90.
-        Absolute values are rupees added or subtracted. Disabled sides return None.
+        UNDERLYING_POINTS on a call at 82,000 with 100/50 is 82,100 and 81,950.
+        The same points on a put are 81,900 and 82,050.
+        OPTION_PREMIUM_POINTS adds or subtracts points from the long premium.
+        A disabled side returns None.
     """
     if CONFIG is None:
         raise RuntimeError("Config is not loaded")
     take_profit: float | None = None
     stop_loss: float | None = None
+    if CONFIG.tp_sl_mode == "UNDERLYING_POINTS":
+        if underlying_price <= 0:
+            raise RuntimeError("Underlying entry price is required for index-point TP/SL")
+        direction = 1.0 if option_type == "CE" else -1.0
+        if CONFIG.tp_enabled:
+            take_profit = underlying_price + (direction * CONFIG.tp_points)
+        if CONFIG.sl_enabled:
+            stop_loss = underlying_price - (direction * CONFIG.sl_points)
+        return take_profit, stop_loss
     if CONFIG.tp_enabled:
-        if CONFIG.tp_type == "PERCENT":
-            take_profit = entry_price * (1 + (CONFIG.tp_value / 100.0))
-        else:
-            take_profit = entry_price + CONFIG.tp_value
-        take_profit = round_to_tick(take_profit, tick_size)
+        take_profit = round_to_tick(entry_premium + CONFIG.tp_points, tick_size)
     if CONFIG.sl_enabled:
-        if CONFIG.sl_type == "PERCENT":
-            stop_loss = entry_price * (1 - (CONFIG.sl_value / 100.0))
-        else:
-            stop_loss = entry_price - CONFIG.sl_value
-        stop_loss = round_to_tick(stop_loss, tick_size)
+        stop_loss = round_to_tick(entry_premium - CONFIG.sl_points, tick_size)
         if stop_loss <= 0:
             raise RuntimeError("Stop loss rounded to a non-positive premium")
     if take_profit is not None and stop_loss is not None and stop_loss >= take_profit:
         raise RuntimeError("Stop loss must be below take profit")
     return take_profit, stop_loss
+
+
+def build_position(
+    contract: OptionContract,
+    signal: str,
+    entry_price: float,
+    quantity: int,
+    order_id: str,
+    order_tag: str,
+    underlying_price: float | None = None,
+) -> Position:
+    """Create the single long-option position and its TP/SL levels.
+
+    Purpose:
+        Use one construction path for paper fills, live fills, and restored positions.
+
+    Inputs:
+        Contract, signal, option fill, quantity, order identity, and the index price.
+
+    Output:
+        A Position. The index price is stored even when targets use the premium.
+
+    Trading use:
+        Index targets are measured from this underlying price, not from a later quote.
+    """
+    if CONFIG is None:
+        raise RuntimeError("Config is not loaded")
+    underlying = STATE.underlying_ltp if underlying_price is None else underlying_price
+    if underlying is None:
+        raise RuntimeError("Cannot open a position without the underlying price")
+    tp_price, sl_price = calculate_tp_sl(entry_price, underlying, contract.option_type, contract.tick_size)
+    return Position(
+        security_id=contract.security_id,
+        trading_symbol=contract.trading_symbol,
+        option_type=contract.option_type,
+        strike=contract.strike,
+        expiry=contract.expiry,
+        quantity=quantity,
+        lot_size=contract.lot_size,
+        tick_size=contract.tick_size,
+        entry_price=entry_price,
+        underlying_entry=underlying,
+        product_type=CONFIG.product_type,
+        exchange_segment=contract.exchange_segment,
+        entry_time=now_in_tz(),
+        order_id=order_id,
+        order_tag=order_tag,
+        signal=signal,
+        tp_price=tp_price,
+        sl_price=sl_price,
+    )
 
 
 def _record_exit(position: Position, exit_price: float, reason: str, order_id: str) -> TradeRecord:
@@ -2512,25 +3060,27 @@ def close_current_position(reason: str) -> bool:
     return STATE.position is None
 
 
-def place_entry_order(signal: str, candle_time: datetime) -> None:
+def place_entry_order(signal: str, bar_id: str) -> None:
     """Select the option and hand it to paper or live entry.
 
     Purpose:
         One entry door so the strategy does not call the broker itself.
 
     Inputs:
-        BUY_CE or BUY_PE, and the candle that created it.
+        BUY_CE or BUY_PE, and the bar identity that created it.
 
     Output:
         None. PAPER becomes LONG_OPTION. LIVE becomes ENTRY_PENDING or LONG_OPTION.
 
     Trading use:
         The option chain is fetched here, not on every poll. PAPER cannot reach
-        the live order function.
+        the live order function. BACKTEST never calls this function.
     """
     if CONFIG is None:
         raise RuntimeError("Config is not loaded")
-    if STATE.last_signal_candle == candle_time:
+    if CONFIG.trading_mode == "BACKTEST":
+        raise RuntimeError("BACKTEST cannot place an order")
+    if STATE.last_signal_bar == bar_id:
         return
     if STATE.status != "FLAT" or STATE.position is not None:
         note("Entry skipped: NOT_FLAT")
@@ -2539,13 +3089,20 @@ def place_entry_order(signal: str, candle_time: datetime) -> None:
     if spot is None:
         raise RuntimeError("Cannot select a strike without the underlying price")
     _spot, rows = fetch_option_chain(STATE.resolved_expiry)
-    contract = select_option_contract(
-        rows,
-        spot,
-        option_side(signal),
-        CONFIG.strike_mode,
-        CONFIG.strike_offset,
-    )
+    try:
+        contract = select_option_contract(
+            rows,
+            spot,
+            option_side(signal),
+            CONFIG.selection_mode,
+            CONFIG.strike_offset,
+        )
+    except PremiumMatchError as exc:
+        STATE.entry_block_reason = "ENTRY BLOCKED: NO PREMIUM MATCH"
+        STATE.signal_reason = STATE.entry_block_reason
+        STATE.last_signal_bar = bar_id
+        note(str(exc))
+        return
     premium = contract.ask or contract.ltp
     if premium is None:
         premium = fetch_ltp(contract.security_id, contract.exchange_segment)
@@ -2557,7 +3114,7 @@ def place_entry_order(signal: str, candle_time: datetime) -> None:
         price = limit_price("BUY", contract, premium)
     elif CONFIG.order_type == "MARKET":
         price = premium
-    tp_price, sl_price = calculate_tp_sl(price, contract.tick_size)
+    tp_price, sl_price = calculate_tp_sl(price, spot, contract.option_type, contract.tick_size)
     if CONFIG.trading_mode == "PAPER":
         preview = build_order_preview(contract, "BUY", order_quantity(contract), price, signal, tp_price, sl_price)
         print(preview)
@@ -2634,30 +3191,46 @@ def validate_entry(signal: str) -> tuple[bool, str]:
     return True, "OK"
 
 
-def check_take_profit() -> bool:
-    """True when the option premium has reached the configured target.
+def _target_reached(position: Position, level: float | None, take_profit: bool) -> bool:
+    """True when the watched price has reached one TP or SL level.
 
-    Missing premiums do not count as a hit.
+    Underlying mode watches the index. Premium mode watches the option.
+    A missing price is not a hit. Calls and puts use opposite index directions.
+    """
+    if position is None or level is None or CONFIG is None:
+        return False
+    if CONFIG.tp_sl_mode == "UNDERLYING_POINTS":
+        price = STATE.underlying_ltp
+        if price is None:
+            return False
+        if position.option_type == "CE":
+            return price >= level if take_profit else price <= level
+        return price <= level if take_profit else price >= level
+    if STATE.option_ltp is None or STATE.quote_failed:
+        return False
+    return STATE.option_ltp >= level if take_profit else STATE.option_ltp <= level
+
+
+def check_take_profit() -> bool:
+    """True when the configured take-profit level has been reached.
+
+    Missing prices do not count as a hit.
     """
     position = get_current_position()
-    if position is None or not position.tp_price or STATE.option_ltp is None or STATE.quote_failed:
+    if position is None or CONFIG is None or not CONFIG.tp_enabled or STATE.status != "LONG_OPTION":
         return False
-    if CONFIG is None or not CONFIG.tp_enabled or STATE.status != "LONG_OPTION":
-        return False
-    return STATE.option_ltp >= position.tp_price
+    return _target_reached(position, position.tp_price, True)
 
 
 def check_stop_loss() -> bool:
-    """True when the option premium has fallen to the configured stop.
+    """True when the configured stop-loss level has been reached.
 
-    Missing premiums do not count as a hit.
+    Missing prices do not count as a hit.
     """
     position = get_current_position()
-    if position is None or not position.sl_price or STATE.option_ltp is None or STATE.quote_failed:
+    if position is None or CONFIG is None or not CONFIG.sl_enabled or STATE.status != "LONG_OPTION":
         return False
-    if CONFIG is None or not CONFIG.sl_enabled or STATE.status != "LONG_OPTION":
-        return False
-    return STATE.option_ltp <= position.sl_price
+    return _target_reached(position, position.sl_price, False)
 
 
 def check_opposite_signal(signal: str) -> bool:
@@ -2714,8 +3287,9 @@ def apply_risk_exits() -> bool:
     """Close for TP, SL, or daily loss. Returns True when that exit has started.
 
     The poll order is take profit, then stop loss, then the daily loss limit.
-    Each of those stops the bot once the close is confirmed. A live exit that
-    is still pending stores the reason and stops on a later poll.
+    Daily loss always stops the bot. TP and SL stop the bot only when
+    stop_bot_after_tp_sl is true. A same-cycle re-entry is still blocked.
+    A live exit that is still pending stores the reason and finishes later.
     """
     if STATE.status == "FLAT" and check_daily_loss():
         STATE.max_loss_hit = True
@@ -2728,16 +3302,21 @@ def apply_risk_exits() -> bool:
     if check_take_profit():
         reason = "TP"
     elif check_stop_loss():
-        STATE.stop_loss_hit = True
+        if CONFIG is not None and CONFIG.no_reentry_after_stop_loss:
+            STATE.stop_loss_hit = True
         reason = "SL"
     elif check_daily_loss():
         STATE.max_loss_hit = True
         reason = "MAX_DAILY_LOSS"
     if reason is None:
         return False
-    STATE.shutdown_after_exit = reason
+    stop_after = reason == "MAX_DAILY_LOSS" or (reason in {"TP", "SL"} and CONFIG is not None and CONFIG.stop_bot_after_tp_sl)
+    if stop_after:
+        STATE.shutdown_after_exit = reason
+    STATE.entry_skip_bar = STATE.bar_id
     if close_current_position(reason):
-        graceful_shutdown(reason)
+        if stop_after:
+            graceful_shutdown(reason)
     return True
 
 
@@ -2772,14 +3351,14 @@ def check_trading_session(moment: datetime | None = None) -> str:
     """Return OPEN, BEFORE_START, or AFTER_STOP.
 
     Purpose:
-        Apply the scheduled window only when the session is enabled.
+        Apply the scheduled window when run_mode is SCHEDULED.
 
     Inputs:
         Current time in the configured timezone.
 
     Output:
         OPEN when a new entry is allowed by the clock.
-        CONTINUOUS mode and a disabled session stay OPEN.
+        CONTINUOUS mode stays OPEN.
 
     Trading use:
         AFTER_STOP can close and exit. BEFORE_START only waits.
@@ -2787,7 +3366,7 @@ def check_trading_session(moment: datetime | None = None) -> str:
     if CONFIG is None:
         return "BEFORE_START"
     current = moment or now_in_tz()
-    if not CONFIG.session_enabled or CONFIG.run_mode == "CONTINUOUS":
+    if CONFIG.run_mode == "CONTINUOUS":
         return "OPEN"
     start = _parse_clock(CONFIG.start_time, "start_time")
     stop = _parse_clock(CONFIG.stop_time, "stop_time")
@@ -2848,7 +3427,7 @@ def enforce_session(moment: datetime) -> None:
         STATE.session_stop_reached = True
         STATE.allow_entries = False
         note("Session stop reached. New entries are blocked.")
-    should_close = CONFIG.close_all_positions_at_stop and CONFIG.holding_mode == "INTRADAY"
+    should_close = CONFIG.close_all_positions_at_stop
     if should_close and get_current_position() is not None and STATE.status != "EXIT_PENDING":
         if CONFIG.stop_bot_after_close:
             STATE.shutdown_after_exit = "SESSION_END"
@@ -2864,10 +3443,10 @@ def mark_data_status(moment: datetime) -> None:
     if STATE.market_status != "OPEN":
         STATE.data_status = "MARKET CLOSED"
         return
-    candle_stale = STATE.candle_time is None
-    if CONFIG is not None and STATE.candle_time is not None:
-        age_limit = timedelta(minutes=CONFIG.timeframe_minutes * 2)
-        candle_stale = (moment - STATE.candle_time) > age_limit
+    candle_stale = STATE.source_candle_time is None
+    if CONFIG is not None and STATE.source_candle_time is not None:
+        age_limit = timedelta(minutes=bar_minutes() * 2)
+        candle_stale = (moment - STATE.source_candle_time) > age_limit
     if STATE.quote_failed:
         STATE.data_status = "DATA ERROR"
     elif candle_stale:
@@ -2934,29 +3513,50 @@ def render_startup() -> None:
     if CONFIG is None:
         return
     quantity = "-"
+    lot_size = STATE.sample_lot_size or "-"
     if STATE.sample_lot_size:
         quantity = str(CONFIG.lots * STATE.sample_lot_size)
+    if CONFIG.candle_mode == "RENKO":
+        chart = f"RENKO brick {CONFIG.renko_brick_size_points:g} points"
+    else:
+        chart = f"NORMAL {CONFIG.timeframe_minutes}m"
+    rsi_text = "ENABLED" if CONFIG.rsi_enabled else "DISABLED"
+    if CONFIG.selection_mode == "PREMIUM":
+        selection = f"PREMIUM target {CONFIG.target_premium:g} tolerance {CONFIG.premium_tolerance:g}"
+    else:
+        selection = f"{CONFIG.selection_mode} offset {CONFIG.strike_offset}"
     lines = [
-        f"{BOT_NAME}  v{BOT_VERSION}",
-        f"Mode: {CONFIG.trading_mode}",
-        f"Underlying: {CONFIG.underlying}  id {STATE.underlying_security_id}  ({STATE.underlying_symbol})",
-        f"Timeframe: {CONFIG.timeframe_minutes}m   Half Trend {CONFIG.amplitude}, {CONFIG.channel_deviation}",
-        f"Expiry: {CONFIG.expiry_mode} {STATE.resolved_expiry}",
-        f"Strike: {CONFIG.strike_mode} offset {CONFIG.strike_offset}",
-        f"Lots: {CONFIG.lots}   sample lot {STATE.sample_lot_size or '-'}   sample quantity {quantity}",
-        f"Order: {CONFIG.order_type}   Product: {CONFIG.product_type}   Holding: {CONFIG.holding_mode}",
-        f"TP: {CONFIG.tp_type} {CONFIG.tp_value} enabled={CONFIG.tp_enabled}",
-        f"SL: {CONFIG.sl_type} {CONFIG.sl_value} enabled={CONFIG.sl_enabled}",
-        f"Max daily loss: {format_inr(CONFIG.max_loss_per_day_inr)}   Max entries: {CONFIG.max_orders_per_day}",
-        f"Run: {CONFIG.run_mode}   Session {CONFIG.start_time}-{CONFIG.stop_time} {CONFIG.timezone_name}",
-        f"Session enabled: {CONFIG.session_enabled}   Close on stop: {CONFIG.close_all_positions_at_stop}",
-        f"Stop process after close: {CONFIG.stop_bot_after_close}",
-        f"Poll: {CONFIG.polling_seconds}s   Post-close: {CONFIG.post_close_polls} x {CONFIG.post_close_poll_seconds}s",
+        f"BOT NAME: {BOT_NAME}",
+        f"VERSION: {BOT_VERSION}",
+        f"TRADING MODE: {CONFIG.trading_mode}",
+        f"CANDLE MODE: {CONFIG.candle_mode}",
+        f"UNDERLYING: {CONFIG.underlying}  id {STATE.underlying_security_id}  ({STATE.underlying_symbol})",
+        f"TIMEFRAME / RENKO BRICK: {chart}",
+        f"HALFTREND: amplitude {CONFIG.amplitude}, channel {CONFIG.channel_deviation}",
+        f"SIDEWAYS FILTER: {CONFIG.sideways_filter_enabled} lookback {CONFIG.sideways_lookback} tolerance {CONFIG.sideways_tolerance_points:g}",
+        f"RSI STATUS: {rsi_text} period {CONFIG.rsi_period} bullish>={CONFIG.rsi_bullish_min:g} bearish<={CONFIG.rsi_bearish_max:g}",
+        f"OPTION SELECTION: {selection}",
+        f"EXPIRY: {CONFIG.expiry_mode} {STATE.resolved_expiry}",
+        f"LOTS: {CONFIG.lots}",
+        f"LOT SIZE: {lot_size}",
+        f"QUANTITY: {quantity}",
+        f"ORDER: {CONFIG.order_type}  PRODUCT: {CONFIG.product_type}",
+        f"TP/SL MODE: {CONFIG.tp_sl_mode}",
+        f"TP: {CONFIG.tp_points:g} points enabled={CONFIG.tp_enabled}",
+        f"SL: {CONFIG.sl_points:g} points enabled={CONFIG.sl_enabled}",
+        f"STOP AFTER TP/SL: {CONFIG.stop_bot_after_tp_sl}",
+        f"MAX LOSS: {format_inr(CONFIG.max_loss_per_day_inr)}",
+        f"MAX ORDERS: {CONFIG.max_orders_per_day}",
+        f"RUN MODE: {CONFIG.run_mode}",
+        f"SESSION: {CONFIG.start_time}-{CONFIG.stop_time}",
+        f"TIMEZONE: {CONFIG.timezone_name}",
+        f"POLLING: {CONFIG.polling_seconds}s  Post-close: {CONFIG.post_close_polls} x {CONFIG.post_close_poll_seconds}s",
         "P&L shown by this bot is gross option premium, before charges and slippage.",
+        "Half Trend is a transparent standard-style calculation. It is not claimed to match Dhan byte for byte.",
     ]
     print("\n".join(lines))
     if CONFIG.trading_mode == "LIVE":
-        print("WARNING: LIVE TRADING ENABLED")
+        print("!!! WARNING: LIVE TRADING ENABLED !!!")
 
 
 def render_dashboard() -> None:
@@ -2978,11 +3578,13 @@ def render_dashboard() -> None:
     if CONFIG is None:
         return
     position = get_current_position()
+    index_name = CONFIG.underlying
     if position is None:
         option_name = "-"
         position_text = "FLAT"
         quantity = "-"
         entry = "-"
+        index_entry = "-"
         take_profit = "-"
         stop_loss = "-"
         current_pnl = format_inr(0.0)
@@ -2991,50 +3593,82 @@ def render_dashboard() -> None:
         position_text = f"LONG {position.option_type}"
         quantity = str(position.quantity)
         entry = format_inr(position.entry_price)
-        take_profit = format_inr(position.tp_price)
-        stop_loss = format_inr(position.sl_price)
+        index_entry = format_number(position.underlying_entry)
+        if CONFIG.tp_sl_mode == "UNDERLYING_POINTS":
+            take_profit = format_number(position.tp_price)
+            stop_loss = format_number(position.sl_price)
+        else:
+            take_profit = format_inr(position.tp_price)
+            stop_loss = format_inr(position.sl_price)
         current_pnl = format_inr(STATE.unrealized_pnl)
     if not check_order_limit() and STATE.status == "FLAT":
-        order_text = f"{STATE.orders_today} / {CONFIG.max_orders_per_day}  MAX ORDERS REACHED"
+        order_text = f"{STATE.orders_today} / {CONFIG.max_orders_per_day} MAX ORDERS"
     else:
         order_text = f"{STATE.orders_today} / {CONFIG.max_orders_per_day}"
-    candle_text = STATE.candle_time.strftime("%Y-%m-%d %H:%M:%S") if STATE.candle_time else "-"
+    candle_text = STATE.candle_time.strftime("%H:%M:%S") if STATE.candle_time else "-"
+    rsi_text = "DISABLED" if STATE.rsi_filter == "DISABLED" else (
+        "-" if STATE.rsi_value is None else f"{STATE.rsi_value:.2f}"
+    )
+    if CONFIG.candle_mode == "RENKO":
+        strategy = "RENKO + HALFTREND" + (" + RSI" if CONFIG.rsi_enabled else "")
+    else:
+        strategy = "NORMAL + HALFTREND" + (" + RSI" if CONFIG.rsi_enabled else "")
+    why = STATE.entry_block_reason or STATE.signal_reason
     rows = [
         _box_rule("╔", "═", "╗"),
         _box_row(BOT_NAME),
         _box_rule("╠", "═", "╣"),
         _box_row(f"MODE        : {CONFIG.trading_mode}"),
+        _box_row(f"STRATEGY    : {strategy}"),
         _box_row(f"UNDERLYING  : {CONFIG.underlying}"),
-        _box_row(f"TIMEFRAME   : {CONFIG.timeframe_minutes}M"),
         _box_row(f"MARKET      : {STATE.market_status}"),
         _box_row(f"DATA        : {STATE.data_status}"),
         _box_rule("╠", "═", "╣"),
-        _box_row(f"UNDERLYING LTP : {format_number(STATE.underlying_ltp)}"),
-        _box_row(f"HALF TREND     : {format_number(STATE.half_trend_value)}"),
-        _box_row(f"SIGNAL         : {STATE.signal_label}"),
-        _box_row(f"CANDLE         : {candle_text}"),
-        _box_row(f"WHY            : {STATE.signal_reason}"),
-        _box_rule("╠", "═", "╣"),
-        _box_row(f"OPTION         : {option_name}"),
-        _box_row(f"OPTION LTP     : {format_inr(STATE.option_ltp)}"),
-        _box_row(f"POSITION       : {position_text}"),
-        _box_row(f"STATE          : {STATE.status}"),
-        _box_row(f"QUANTITY       : {quantity}"),
-        _box_row(f"ENTRY          : {entry}"),
-        _box_row(f"TP             : {take_profit}"),
-        _box_row(f"SL             : {stop_loss}"),
-        _box_row(f"CURRENT P&L    : {current_pnl} gross"),
-        _box_rule("╠", "═", "╣"),
-        _box_row(f"TODAY ALGO P&L : {format_inr(calculate_combined_algo_pnl())} gross"),
-        _box_row(f"ORDERS TODAY   : {order_text}"),
-        _box_row(f"DAILY LOSS LIM : {format_inr(CONFIG.max_loss_per_day_inr)}"),
-        _box_rule("╠", "═", "╣"),
-        _box_row(f"POLLING        : {CONFIG.polling_seconds} sec"),
-        _box_row(f"NEXT POLL      : {STATE.next_poll_seconds} sec"),
-        _box_row(f"POST CLOSE     : {STATE.post_close_polls_done}/{CONFIG.post_close_polls}"),
-        _box_row(f"LAST ACTION    : {STATE.last_action}"),
-        _box_rule("╚", "═", "╝"),
+        _box_row(f"{index_name} LTP  : {format_number(STATE.underlying_ltp)}"),
+        _box_row(f"CANDLE      : {CONFIG.timeframe_minutes}M" if CONFIG.candle_mode == "NORMAL" else f"RENKO BRICK : {CONFIG.renko_brick_size_points:g} POINTS"),
+        _box_row(f"CANDLE TIME : {candle_text}"),
+        _box_row(f"HALF TREND  : {format_number(STATE.half_trend_value)}"),
+        _box_row(f"RSI         : {rsi_text}"),
+        _box_row(f"RSI FILTER  : {STATE.rsi_filter}"),
+        _box_row(f"MARKET STATE: {STATE.market_state}"),
+        _box_row(f"SIGNAL      : {STATE.signal_label}"),
+        _box_row(f"WHY         : {why}"),
     ]
+    if CONFIG.candle_mode == "RENKO":
+        rows.extend(
+            [
+                _box_row(f"BRICK STATE : {STATE.brick_state}"),
+                _box_row(f"HT POSITION : {STATE.ht_position}"),
+                _box_row(f"ENTRY CONFIRM: {STATE.entry_confirm_count} / {CONFIG.renko_entry_confirmation_bricks}"),
+                _box_row(f"EXIT CONFIRM : {STATE.exit_confirm_count} / {CONFIG.renko_exit_confirmation_bricks}"),
+            ]
+        )
+    rows.extend(
+        [
+            _box_rule("╠", "═", "╣"),
+            _box_row(f"OPTION      : {option_name}"),
+            _box_row(f"PREMIUM     : {format_inr(STATE.option_ltp)}"),
+            _box_row(f"POSITION    : {position_text}"),
+            _box_row(f"STATE       : {STATE.status}"),
+            _box_row(f"QUANTITY    : {quantity}"),
+            _box_row(f"ENTRY       : {entry}"),
+            _box_row(f"CURRENT P&L : {current_pnl}"),
+            _box_rule("╠", "═", "╣"),
+            _box_row(f"{index_name} ENTRY: {index_entry}"),
+            _box_row(f"{index_name} NOW  : {format_number(STATE.underlying_ltp)}"),
+            _box_row(f"TP          : {take_profit}"),
+            _box_row(f"SL          : {stop_loss}"),
+            _box_rule("╠", "═", "╣"),
+            _box_row(f"TODAY P&L   : {format_inr(calculate_combined_algo_pnl())}"),
+            _box_row(f"ORDERS      : {order_text}"),
+            _box_row(f"DAILY LIMIT : -{format_inr(CONFIG.max_loss_per_day_inr)}"),
+            _box_row(f"POLLING     : {CONFIG.polling_seconds} SEC"),
+            _box_row(f"NEXT POLL   : {STATE.next_poll_seconds} SEC"),
+            _box_row(f"POST CLOSE  : {STATE.post_close_polls_done}/{CONFIG.post_close_polls}"),
+            _box_row(f"LAST ACTION : {STATE.last_action}"),
+            _box_rule("╚", "═", "╝"),
+        ]
+    )
     if sys.stdout.isatty():
         print("\033[2J\033[H", end="")
     print("\n".join(rows))
@@ -3068,8 +3702,6 @@ def _should_close_on_shutdown(reason: str) -> bool:
         return True
     if reason == "CRITICAL":
         return True
-    if reason in {"SESSION_END", "MARKET_CLOSED"} and CONFIG.holding_mode != "INTRADAY":
-        return False
     if reason in {"MANUAL_STOP", "SESSION_END", "MARKET_CLOSED", "CRITICAL"}:
         return CONFIG.close_all_positions_at_stop or reason == "CRITICAL"
     return False
@@ -3155,8 +3787,6 @@ def graceful_shutdown(reason: str) -> None:
         _wait_for_exit()
     except Exception as exc:
         note(f"Shutdown could not finish the position safely: {exc}")
-    if reason in {"SESSION_END", "MARKET_CLOSED"} and CONFIG is not None and CONFIG.holding_mode != "INTRADAY":
-        note("Holding mode is not INTRADAY, so the option was not force-closed at the session end.")
     _print_final_summary(reason)
     if STOP_PATH.exists():
         try:
@@ -3300,8 +3930,7 @@ def poll_closed_market(moment: datetime) -> None:
             )
         if STATE.post_close_polls_done >= CONFIG.post_close_polls:
             should_close = (
-                CONFIG.holding_mode == "INTRADAY"
-                and CONFIG.close_all_positions_at_stop
+                CONFIG.close_all_positions_at_stop
                 and get_current_position() is not None
                 and STATE.status != "EXIT_PENDING"
             )
@@ -3346,8 +3975,449 @@ def run_cycle() -> None:
             sleep_until_next_poll(CONFIG.polling_seconds if CONFIG else 5)
 
 
+# ============================================================
+# BACKTEST ENGINE
+# ============================================================
+
+PREMIUM_HISTORY_UNAVAILABLE = (
+    "Historical option premium data is unavailable for this backtest configuration."
+)
+
+
+def _date_chunks(start: date, end: date, days: int = 5) -> list[tuple[date, date]]:
+    """Split a date range so one history request does not ask for unlimited data."""
+    chunks: list[tuple[date, date]] = []
+    cursor = start
+    while cursor <= end:
+        chunk_end = min(cursor + timedelta(days=days - 1), end)
+        chunks.append((cursor, chunk_end))
+        cursor = chunk_end + timedelta(days=1)
+    return chunks
+
+
+def _concat_candles(frames: list[pd.DataFrame]) -> pd.DataFrame:
+    """Combine history chunks and keep one row per timestamp."""
+    if not frames:
+        return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close"])
+    data = pd.concat(frames, ignore_index=True)
+    data = data.sort_values("timestamp").drop_duplicates("timestamp", keep="last")
+    return data.reset_index(drop=True)
+
+
+def _fetch_underlying_history(start: date, end: date, interval: int) -> pd.DataFrame:
+    """Download index candles for the requested backtest range, in short chunks."""
+    if BROKER is None or CONFIG is None:
+        raise RuntimeError("Dhan and config must be ready before a backtest")
+    frames: list[pd.DataFrame] = []
+    errors: list[str] = []
+    for chunk_start, chunk_end in _date_chunks(start, end):
+        try:
+            response = BROKER.dhan.intraday_minute_data(
+                security_id=str(STATE.underlying_security_id),
+                exchange_segment=sdk_value("INDEX"),
+                instrument_type="INDEX",
+                from_date=chunk_start.isoformat(),
+                to_date=chunk_end.isoformat(),
+                interval=int(interval),
+            )
+            frame = _candles_from_payload(unwrap_sdk_data(response))
+            if not frame.empty:
+                frames.append(frame)
+        except Exception as exc:
+            errors.append(str(exc))
+        time.sleep(0.25)
+    data = _concat_candles(frames)
+    if data.empty:
+        detail = errors[-1] if errors else "Dhan returned no candles"
+        raise RuntimeError(f"No underlying history was returned. {detail}")
+    stamps = data["timestamp"].map(lambda value: value.date())
+    data = data[(stamps >= start) & (stamps <= end)].reset_index(drop=True)
+    return data
+
+
+def _rolling_strike(option_type: str) -> str:
+    """Map ATM/ITM/OTM to the rolling-option strike code Dhan accepts."""
+    if CONFIG is None or CONFIG.selection_mode == "ATM":
+        return "ATM"
+    steps = max(CONFIG.strike_offset, 1)
+    if option_type == "CE":
+        signed = -steps if CONFIG.selection_mode == "ITM" else steps
+    else:
+        signed = steps if CONFIG.selection_mode == "ITM" else -steps
+    if signed > 0:
+        return f"ATM+{signed}"
+    if signed < 0:
+        return f"ATM{signed}"
+    return "ATM"
+
+
+def _fetch_rolling_option_history(
+    strike: str,
+    drv_option_type: str,
+    start: date,
+    end: date,
+    interval: int,
+) -> pd.DataFrame:
+    """Download rolling expired-option candles. An empty frame means the API gave no premiums."""
+    if BROKER is None or CONFIG is None:
+        raise RuntimeError("Dhan and config must be ready before a backtest")
+    frames: list[pd.DataFrame] = []
+    for chunk_start, chunk_end in _date_chunks(start, end):
+        try:
+            response = BROKER.dhan.expired_options_data(
+                security_id=str(STATE.underlying_security_id),
+                exchange_segment=sdk_value(CONFIG.option_segment),
+                instrument_type="OPTIDX",
+                expiry_flag="WEEK",
+                expiry_code=1,
+                strike=strike,
+                drv_option_type=drv_option_type,
+                required_data=["open", "high", "low", "close"],
+                from_date=chunk_start.isoformat(),
+                to_date=chunk_end.isoformat(),
+                interval=int(interval),
+            )
+            frame = _candles_from_payload(unwrap_sdk_data(response))
+            if not frame.empty:
+                frames.append(frame)
+        except Exception:
+            pass
+        time.sleep(0.25)
+    data = _concat_candles(frames)
+    if data.empty:
+        return data
+    stamps = data["timestamp"].map(lambda value: value.date())
+    return data[(stamps >= start) & (stamps <= end)].reset_index(drop=True)
+
+
+def _current_option_lot(master: pd.DataFrame) -> int:
+    """Read one current index-option lot size. It is not a historical lot."""
+    if CONFIG is None:
+        raise RuntimeError("Config is not loaded")
+    spec = underlying_spec(CONFIG.underlying)
+    exchange = master["SEM_EXM_EXCH_ID"].astype(str).str.upper().str.strip()
+    instrument = master["SEM_INSTRUMENT_NAME"].astype(str).str.upper().str.strip()
+    option_type = master["SEM_OPTION_TYPE"].astype(str).str.upper().str.strip()
+    rows = master[
+        (exchange == spec["option_exchange"])
+        & instrument.eq("OPTIDX")
+        & option_type.isin({"CE", "CALL"})
+    ]
+    if rows.empty:
+        raise RuntimeError(f"Security master has no {CONFIG.underlying} option lot size")
+    lot = _as_int(rows.iloc[0]["SEM_LOT_UNITS"], "lot size")
+    if lot < 1:
+        raise RuntimeError("Security master lot size is not usable")
+    return lot
+
+
+def _align_premium(signal_frame: pd.DataFrame, option_frame: pd.DataFrame, prefix: str) -> pd.DataFrame:
+    """Attach the latest known option OHLC at or before each signal timestamp."""
+    right = option_frame[["timestamp", "high", "low", "close"]].rename(
+        columns={"high": f"{prefix}_high", "low": f"{prefix}_low", "close": f"{prefix}_close"}
+    )
+    left = signal_frame.sort_values("timestamp")
+    right = right.sort_values("timestamp")
+    return pd.merge_asof(left, right, on="timestamp", direction="backward")
+
+
+def _same_bar_exit(option_type: str, high: float, low: float, take_profit: float | None, stop_loss: float | None) -> str | None:
+    """Return TP or SL when this bar could have touched a level. Both touches count as SL.
+
+    Candle history cannot prove which level printed first. The stop is the
+    conservative result.
+    """
+    if CONFIG is None:
+        return None
+    hit_sl = False
+    hit_tp = False
+    if CONFIG.tp_sl_mode == "UNDERLYING_POINTS":
+        if option_type == "CE":
+            hit_sl = stop_loss is not None and low <= stop_loss
+            hit_tp = take_profit is not None and high >= take_profit
+        else:
+            hit_sl = stop_loss is not None and high >= stop_loss
+            hit_tp = take_profit is not None and low <= take_profit
+    else:
+        hit_sl = stop_loss is not None and low <= stop_loss
+        hit_tp = take_profit is not None and high >= take_profit
+    if hit_sl:
+        return "SL"
+    if hit_tp:
+        return "TP"
+    return None
+
+
+def _print_backtest_report(
+    trades: list[TradeRecord],
+    requested_start: date,
+    requested_end: date,
+    actual_start: datetime | None,
+    actual_end: datetime | None,
+    stopped_reason: str,
+) -> None:
+    """Print the historical summary. These numbers are not a forecast."""
+    if CONFIG is None:
+        return
+    wins = [trade.pnl for trade in trades if trade.pnl > 0]
+    losses = [trade.pnl for trade in trades if trade.pnl <= 0]
+    gross = sum(trade.pnl for trade in trades)
+    average = gross / len(trades) if trades else 0.0
+    equity = 0.0
+    peak = 0.0
+    max_drawdown = 0.0
+    for trade in trades:
+        equity += trade.pnl
+        peak = max(peak, equity)
+        max_drawdown = max(max_drawdown, peak - equity)
+    print("")
+    print("SIMULATED / HISTORICAL")
+    print("BACKTEST COMPLETE")
+    print("")
+    print("Strategy: HalfTrend + optional RSI")
+    print(f"Candle Mode: {CONFIG.candle_mode}")
+    print(f"Underlying: {CONFIG.underlying}")
+    print(f"Requested period: {requested_start.isoformat()} to {requested_end.isoformat()}")
+    if actual_start is not None and actual_end is not None:
+        print(f"Received period: {actual_start.date().isoformat()} to {actual_end.date().isoformat()}")
+    print(f"Period: {requested_start.isoformat()} to {requested_end.isoformat()}")
+    print("")
+    print(f"Total Trades: {len(trades)}")
+    print(f"Winning Trades: {len(wins)}")
+    print(f"Losing Trades: {len(losses)}")
+    win_rate = (100.0 * len(wins) / len(trades)) if trades else 0.0
+    print(f"Win Rate: {win_rate:.2f}%")
+    print(f"Gross P&L: {format_inr(gross)}")
+    print(f"Average Trade: {format_inr(average)}")
+    print(f"Largest Win: {format_inr(max(wins) if wins else 0.0)}")
+    print(f"Largest Loss: {format_inr(min(losses) if losses else 0.0)}")
+    print(f"Max Drawdown: {format_inr(max_drawdown)}")
+    print("")
+    print("Option P&L uses Dhan rolling-option closes. It is not a promise of future results.")
+    print("If one candle could have touched both TP and SL, the stop is assumed to have happened first.")
+    print("Quantity uses the current security-master lot size, which can differ from an expired contract.")
+    if stopped_reason:
+        print(stopped_reason)
+    print("No live order was sent.")
+
+
+def _run_backtest_loop(
+    signal_frame: pd.DataFrame,
+    quantity: int,
+) -> tuple[list[TradeRecord], str]:
+    """Walk completed bars once. No bar is allowed to see a later bar."""
+    if CONFIG is None:
+        raise RuntimeError("Config is not loaded")
+    trades: list[TradeRecord] = []
+    position: dict[str, Any] | None = None
+    day_realized = 0.0
+    orders_today = 0
+    trading_day: date | None = None
+    stop_lock = False
+    loss_lock = False
+    stopped = ""
+    start_clock = _parse_clock(CONFIG.start_time, "start_time")
+    stop_clock = _parse_clock(CONFIG.stop_time, "stop_time")
+    warmup = max(CONFIG.amplitude, CONFIG.sideways_lookback, CONFIG.rsi_period if CONFIG.rsi_enabled else 1)
+
+    def close_trade(reason: str, exit_premium: float, when: datetime) -> None:
+        nonlocal position, day_realized, stopped, stop_lock, loss_lock
+        if position is None:
+            return
+        pnl = (exit_premium - float(position["entry_premium"])) * quantity
+        trades.append(
+            TradeRecord(
+                symbol=f"{CONFIG.underlying} {position['option_type']}",
+                option_type=str(position["option_type"]),
+                quantity=quantity,
+                entry_price=float(position["entry_premium"]),
+                exit_price=exit_premium,
+                pnl=pnl,
+                reason=reason,
+                entry_time=position["entry_time"],
+                exit_time=when,
+            )
+        )
+        day_realized += pnl
+        if reason == "SL" and CONFIG.no_reentry_after_stop_loss:
+            stop_lock = True
+        position = None
+        if reason in {"TP", "SL"} and CONFIG.stop_bot_after_tp_sl:
+            stopped = "Backtest stopped after TP/SL because stop_bot_after_tp_sl is true."
+        if day_realized <= -abs(CONFIG.max_loss_per_day_inr):
+            loss_lock = True
+            stopped = "Backtest stopped because combined daily gross P&L reached the loss limit."
+
+    for index in range(len(signal_frame)):
+        if stopped:
+            break
+        if index < warmup:
+            continue
+        row = signal_frame.iloc[index]
+        when = row["timestamp"]
+        if not isinstance(when, datetime):
+            continue
+        bar_day = when.date()
+        if trading_day != bar_day:
+            trading_day = bar_day
+            day_realized = 0.0
+            orders_today = 0
+            stop_lock = False
+            if loss_lock:
+                break
+        clock = when.timetz().replace(tzinfo=None)
+        session_open = CONFIG.run_mode == "CONTINUOUS" or (start_clock <= clock < stop_clock)
+        window = signal_frame.iloc[: index + 1]
+        _refresh_filters(window)
+        option_type = "CE" if position is None else str(position["option_type"])
+        prefix = option_type.lower()
+        premium_close = row.get(f"{prefix}_close")
+        if position is not None:
+            if CONFIG.tp_sl_mode == "UNDERLYING_POINTS":
+                level_high = float(row["high"])
+                level_low = float(row["low"])
+            else:
+                level_high = row.get(f"{prefix}_high")
+                level_low = row.get(f"{prefix}_low")
+            if premium_close is None or pd.isna(premium_close) or pd.isna(level_high) or pd.isna(level_low):
+                print(PREMIUM_HISTORY_UNAVAILABLE)
+                stopped = "Backtest stopped because an open option had no historical premium on this bar."
+                position = None
+                break
+            exit_reason = _same_bar_exit(
+                str(position["option_type"]),
+                float(level_high),
+                float(level_low),
+                position["tp"],
+                position["sl"],
+            )
+            if exit_reason:
+                close_trade(exit_reason, float(premium_close), when)
+                continue
+            if CONFIG.exit_on_opposite_signal:
+                opposite = False
+                if CONFIG.candle_mode == "RENKO":
+                    opposite = renko_exit_ready(window, str(position["option_type"]))
+                else:
+                    direction = generate_normal_signal(window)
+                    opposite = (
+                        (position["option_type"] == "CE" and direction == "BUY_PE")
+                        or (position["option_type"] == "PE" and direction == "BUY_CE")
+                    )
+                if opposite:
+                    close_trade("OPPOSITE_SIGNAL", float(premium_close), when)
+                    continue
+            if CONFIG.close_all_positions_at_stop and CONFIG.run_mode == "SCHEDULED" and clock >= stop_clock:
+                close_trade("SESSION_END", float(premium_close), when)
+            continue
+        if not session_open or stop_lock or loss_lock or orders_today >= CONFIG.max_orders_per_day:
+            continue
+        if day_realized <= -abs(CONFIG.max_loss_per_day_inr):
+            loss_lock = True
+            stopped = "Backtest stopped because combined daily gross P&L reached the loss limit."
+            break
+        if CONFIG.candle_mode == "RENKO":
+            direction = generate_renko_signal(window)
+        else:
+            direction = generate_normal_signal(window)
+        if not entry_filters_pass(direction) or direction is None:
+            continue
+        side = option_side(direction)
+        entry_premium = row.get(f"{side.lower()}_close")
+        if entry_premium is None or pd.isna(entry_premium):
+            continue
+        underlying_entry = float(row["close"])
+        tp_price, sl_price = calculate_tp_sl(float(entry_premium), underlying_entry, side, 0.05)
+        position = {
+            "option_type": side,
+            "entry_premium": float(entry_premium),
+            "entry_time": when,
+            "tp": tp_price,
+            "sl": sl_price,
+        }
+        orders_today += 1
+    if position is not None and not stopped:
+        last = signal_frame.iloc[-1]
+        prefix = str(position["option_type"]).lower()
+        exit_premium = last.get(f"{prefix}_close")
+        if exit_premium is None or pd.isna(exit_premium):
+            print(PREMIUM_HISTORY_UNAVAILABLE)
+            stopped = "Backtest stopped because the final option premium was missing. That open trade was not priced."
+        else:
+            close_trade("END_OF_DATA", float(exit_premium), last["timestamp"])
+    return trades, stopped
+
+
+def run_backtest() -> None:
+    """Replay historical candles and rolling option premiums. Never place an order.
+
+    Purpose:
+        Test the same signal and TP/SL rules on completed history.
+
+    Inputs:
+        config.yaml backtest dates, candle mode, and option selection.
+
+    Output:
+        A printed SIMULATED / HISTORICAL summary, then the process exits.
+
+    Trading use:
+        PREMIUM selection and a calendar CONFIGURED expiry cannot be rebuilt
+        from Dhan's rolling option API, so those runs stop without a P&L.
+        Missing premium history is never replaced with an invented price.
+    """
+    if CONFIG is None or BROKER is None:
+        raise RuntimeError("Backtest is missing config or Dhan")
+    if CONFIG.trading_mode != "BACKTEST":
+        raise RuntimeError("run_backtest was called while trading_mode is not BACKTEST")
+    requested_start = _parse_iso_date(CONFIG.backtest_start_date, "backtest.start_date")
+    requested_end = _parse_iso_date(CONFIG.backtest_end_date, "backtest.end_date")
+    print("SIMULATED / HISTORICAL")
+    print(f"BACKTEST {CONFIG.underlying} {CONFIG.candle_mode}")
+    print("No order will be sent.")
+    if CONFIG.selection_mode == "PREMIUM" or CONFIG.expiry_mode == "CONFIGURED":
+        print(PREMIUM_HISTORY_UNAVAILABLE)
+        print("PREMIUM selection and a calendar expiry are not available from the rolling option history.")
+        raise SystemExit(0)
+    master = load_security_master()
+    resolved = resolve_underlying(master, CONFIG.underlying)
+    STATE.underlying_security_id = resolved["security_id"]
+    STATE.underlying_symbol = resolved["trading_symbol"]
+    STATE.trading_date = requested_start
+    quantity = CONFIG.lots * _current_option_lot(master)
+    interval = 1 if CONFIG.candle_mode == "RENKO" else CONFIG.timeframe_minutes
+    underlying = _fetch_underlying_history(requested_start, requested_end, interval)
+    if underlying.empty:
+        raise RuntimeError("No underlying candles were returned for the backtest range. No order was sent.")
+    actual_start = underlying.iloc[0]["timestamp"]
+    actual_end = underlying.iloc[-1]["timestamp"]
+    if actual_start.date() != requested_start or actual_end.date() != requested_end:
+        print(
+            "Dhan returned a shorter underlying range than requested: "
+            f"{actual_start.date().isoformat()} to {actual_end.date().isoformat()}."
+        )
+        print("The installed history API documents recent minute data. Missing days were not invented.")
+    signal_source = build_renko(underlying, CONFIG.renko_brick_size_points) if CONFIG.candle_mode == "RENKO" else underlying
+    if signal_source.empty:
+        raise RuntimeError("The history did not produce a completed signal bar. No order was sent.")
+    signal_frame = calculate_half_trend(signal_source, CONFIG.amplitude, CONFIG.channel_deviation)
+    signal_frame["rsi"] = calculate_rsi(signal_frame["close"], CONFIG.rsi_period)
+    call_strike = _rolling_strike("CE")
+    put_strike = _rolling_strike("PE")
+    calls = _fetch_rolling_option_history(call_strike, "CALL", requested_start, requested_end, interval if CONFIG.candle_mode == "NORMAL" else 1)
+    puts = _fetch_rolling_option_history(put_strike, "PUT", requested_start, requested_end, interval if CONFIG.candle_mode == "NORMAL" else 1)
+    if calls.empty or puts.empty:
+        print(PREMIUM_HISTORY_UNAVAILABLE)
+        print("The rolling option request returned no premium candles for this strike and date range.")
+        raise SystemExit(0)
+    signal_frame = _align_premium(signal_frame, calls, "ce")
+    signal_frame = _align_premium(signal_frame, puts, "pe")
+    trades, stopped = _run_backtest_loop(signal_frame, quantity)
+    _print_backtest_report(trades, requested_start, requested_end, actual_start, actual_end, stopped)
+    del underlying, signal_source, signal_frame, calls, puts
+
+
 def main() -> None:
-    """Load configuration, connect to Dhan, validate the contract universe, and poll.
+    """Load configuration, connect to Dhan, and either backtest or poll.
 
     Purpose:
         Start the bot.
@@ -3356,11 +4426,12 @@ def main() -> None:
         config.yaml and .env beside this file.
 
     Output:
-        Runs until a shutdown reason exits the process.
+        BACKTEST prints a historical summary and exits.
+        PAPER and LIVE run until a shutdown reason exits the process.
 
     Trading use:
-        PAPER never reaches the live order call. LIVE can place real orders
-        after startup validation and an on-screen preview.
+        PAPER and BACKTEST never reach the live order call. LIVE can place
+        real orders after startup validation and an on-screen preview.
     """
     global CONFIG, BROKER
     try:
@@ -3368,6 +4439,9 @@ def main() -> None:
         CONFIG = load_config()
         client_id, access_token = load_environment()
         BROKER = create_dhan_client(client_id, access_token)
+        if CONFIG.trading_mode == "BACKTEST":
+            run_backtest()
+            return
         startup_checks()
         render_startup()
         while True:
