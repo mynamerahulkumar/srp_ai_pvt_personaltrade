@@ -218,26 +218,30 @@ def _parse_iso_date(value: str, label: str) -> date:
         raise ValueError(f"{label} must be YYYY-MM-DD") from exc
 
 
-def validate_config(config: AppConfig) -> None:
+def validate_config(config: AppConfig, *, for_backtest: bool = False) -> None:
     """Reject settings that would make orders, sessions, or exits ambiguous.
 
     Purpose:
         Stop the process before any order when the YAML is inconsistent.
 
     Inputs:
-        A parsed AppConfig.
+        A parsed AppConfig, and whether this load is for historical replay.
 
     Output:
         None. Raises ValueError with the first problem found.
 
     Trading use:
-        Keeps PAPER, LIVE, and BACKTEST, the index, the product type, and the
-        session clock inside the combinations this bot can actually execute.
+        PAPER/LIVE come from config.yaml. BACKTEST comes only from test.yaml
+        via backtest.py. The index, product type, and session clock must stay
+        inside the combinations this bot can actually execute.
     """
     if config.underlying not in UNDERLYING_SPECS:
         raise ValueError("underlying must be SENSEX, NIFTY, or BANKNIFTY")
-    if config.trading_mode not in {"PAPER", "LIVE", "BACKTEST"}:
-        raise ValueError("trading_mode must be PAPER, LIVE, or BACKTEST")
+    if for_backtest:
+        if config.trading_mode != "BACKTEST":
+            raise ValueError("backtest loads must use trading_mode BACKTEST")
+    elif config.trading_mode not in {"PAPER", "LIVE"}:
+        raise ValueError("trading_mode must be PAPER or LIVE in config.yaml")
     if config.candle_mode not in {"NORMAL", "RENKO"}:
         raise ValueError("candle_mode must be NORMAL or RENKO")
     if config.run_mode not in {"CONTINUOUS", "SCHEDULED"}:
@@ -292,10 +296,11 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError("polling and post-close settings must be at least 1")
     if config.expiry_mode == "CONFIGURED":
         _parse_iso_date(config.expiry, "expiry")
-    start_date = _parse_iso_date(config.backtest_start_date, "backtest.start_date")
-    end_date = _parse_iso_date(config.backtest_end_date, "backtest.end_date")
-    if start_date > end_date:
-        raise ValueError("backtest.start_date must be on or before backtest.end_date")
+    if for_backtest:
+        start_date = _parse_iso_date(config.backtest_start_date, "backtest.start_date")
+        end_date = _parse_iso_date(config.backtest_end_date, "backtest.end_date")
+        if start_date > end_date:
+            raise ValueError("backtest.start_date must be on or before backtest.end_date")
     try:
         ZoneInfo(config.timezone_name)
     except Exception as exc:
@@ -306,31 +311,33 @@ def validate_config(config: AppConfig) -> None:
         raise ValueError("start_time must be earlier than stop_time")
 
 
-def load_config(path: Path = CONFIG_PATH) -> AppConfig:
-    """Load and validate config.yaml.
+def load_config(path: Path = CONFIG_PATH, *, for_backtest: bool = False) -> AppConfig:
+    """Load and validate a YAML trading configuration.
 
     Purpose:
-        Make the YAML file the only source of trading settings.
+        Keep trading settings in YAML. PAPER/LIVE use config.yaml.
+        Historical runs use test.yaml through backtest.py.
 
     Inputs:
-        Path to config.yaml.
+        Path to the YAML file, and for_backtest=True when loading test.yaml.
 
     Output:
         An AppConfig. Invalid files raise ValueError or a YAML error.
 
     Trading use:
-        Every later decision reads this object. Nothing is copied into a
-        second configuration file.
+        Live loads reject BACKTEST and a backtest: block. Backtest loads force
+        trading_mode BACKTEST, require backtest dates, and reject trading_mode
+        in the YAML so modes cannot drift.
     """
+    label = path.name
     if not path.exists():
-        raise ValueError(f"config.yaml was not found at {path}")
+        raise ValueError(f"{label} was not found at {path}")
     try:
         raw = yaml.safe_load(path.read_text(encoding="utf-8"))
     except yaml.YAMLError as exc:
-        raise ValueError(f"config.yaml is not valid YAML: {exc}") from exc
-    root = _require_mapping(raw, "config.yaml")
+        raise ValueError(f"{label} is not valid YAML: {exc}") from exc
+    root = _require_mapping(raw, label)
     allowed_root = {
-        "trading_mode",
         "underlying",
         "candle_mode",
         "timeframe_minutes",
@@ -349,8 +356,16 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         "stop_bot_after_close",
         "post_close_polls",
         "post_close_poll_seconds",
-        "backtest",
     }
+    if for_backtest:
+        allowed_root.add("backtest")
+        if "trading_mode" in root:
+            raise ValueError(
+                f"{label} must not set trading_mode. "
+                "Running backtest.py always means BACKTEST."
+            )
+    else:
+        allowed_root.add("trading_mode")
     _reject_unknown(root, allowed_root, "top-level")
     halftrend = _require_mapping(root.get("halftrend"), "halftrend")
     rsi = _require_mapping(root.get("rsi"), "rsi")
@@ -358,7 +373,16 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
     option = _require_mapping(root.get("option"), "option")
     execution = _require_mapping(root.get("execution"), "execution")
     risk = _require_mapping(root.get("risk"), "risk")
-    backtest = _require_mapping(root.get("backtest"), "backtest")
+    if for_backtest:
+        backtest = _require_mapping(root.get("backtest"), "backtest")
+        _reject_unknown(backtest, {"start_date", "end_date"}, "backtest")
+        backtest_start = str(backtest.get("start_date") or "").strip()
+        backtest_end = str(backtest.get("end_date") or "").strip()
+        trading_mode = "BACKTEST"
+    else:
+        backtest_start = ""
+        backtest_end = ""
+        trading_mode = _as_choice(root.get("trading_mode"), "trading_mode", {"PAPER", "LIVE"})
     _reject_unknown(
         halftrend,
         {"amplitude", "channel_deviation", "sideways_filter_enabled", "sideways_lookback", "sideways_tolerance_points"},
@@ -388,14 +412,13 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         },
         "risk",
     )
-    _reject_unknown(backtest, {"start_date", "end_date"}, "backtest")
     take_profit = _require_mapping(risk.get("take_profit"), "risk.take_profit")
     stop_loss = _require_mapping(risk.get("stop_loss"), "risk.stop_loss")
     _reject_unknown(take_profit, {"enabled", "points"}, "risk.take_profit")
     _reject_unknown(stop_loss, {"enabled", "points"}, "risk.stop_loss")
     expiry = "" if option.get("expiry") is None else str(option.get("expiry")).strip()
     config = AppConfig(
-        trading_mode=_as_choice(root.get("trading_mode"), "trading_mode", {"PAPER", "LIVE", "BACKTEST"}),
+        trading_mode=trading_mode,
         underlying=_as_choice(root.get("underlying"), "underlying", set(UNDERLYING_SPECS)),
         candle_mode=_as_choice(root.get("candle_mode"), "candle_mode", {"NORMAL", "RENKO"}),
         timeframe_minutes=_as_int(root.get("timeframe_minutes"), "timeframe_minutes"),
@@ -441,10 +464,10 @@ def load_config(path: Path = CONFIG_PATH) -> AppConfig:
         stop_bot_after_close=_as_bool(root.get("stop_bot_after_close"), "stop_bot_after_close"),
         post_close_polls=_as_int(root.get("post_close_polls"), "post_close_polls"),
         post_close_poll_seconds=_as_int(root.get("post_close_poll_seconds"), "post_close_poll_seconds"),
-        backtest_start_date=str(backtest.get("start_date") or "").strip(),
-        backtest_end_date=str(backtest.get("end_date") or "").strip(),
+        backtest_start_date=backtest_start,
+        backtest_end_date=backtest_end,
     )
-    validate_config(config)
+    validate_config(config, for_backtest=for_backtest)
     return config
 
 
@@ -4051,6 +4074,53 @@ def _rolling_strike(option_type: str) -> str:
     return "ATM"
 
 
+def _option_candles_from_rolling_payload(payload: Any, drv_option_type: str) -> pd.DataFrame:
+    """Parse Dhan rolling-option history into OHLC rows.
+
+    Purpose:
+        The rolling-option API nests CE/PE under data.data and may return empty
+        iv/oi/strike lists beside full OHLC lists. Only equal-length OHLC fields
+        are kept so pandas does not reject the payload.
+
+    Inputs:
+        Unwrapped SDK data and CALL or PUT.
+
+    Output:
+        timestamp/open/high/low/close frame, or empty when that side is missing.
+    """
+    empty = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close"])
+    if payload is None:
+        return empty
+    body = payload
+    if isinstance(body, dict) and "data" in body and isinstance(body["data"], dict):
+        nested = body["data"]
+        if any(key in nested for key in ("ce", "pe", "CE", "PE")):
+            body = nested
+    if not isinstance(body, dict):
+        return empty
+    side_key = "ce" if str(drv_option_type).upper() == "CALL" else "pe"
+    block = body.get(side_key)
+    if block is None:
+        block = body.get(side_key.upper())
+    if not isinstance(block, dict):
+        return empty
+    lengths = {
+        key: len(value)
+        for key, value in block.items()
+        if isinstance(value, list)
+    }
+    needed = ("timestamp", "open", "high", "low", "close")
+    if any(name not in lengths or lengths[name] == 0 for name in needed):
+        return empty
+    size = lengths["timestamp"]
+    if any(lengths[name] != size for name in needed):
+        return empty
+    cleaned = {name: block[name] for name in needed}
+    if "volume" in lengths and lengths["volume"] == size:
+        cleaned["volume"] = block["volume"]
+    return _candles_from_payload(cleaned)
+
+
 def _fetch_rolling_option_history(
     strike: str,
     drv_option_type: str,
@@ -4062,10 +4132,12 @@ def _fetch_rolling_option_history(
     if BROKER is None or CONFIG is None:
         raise RuntimeError("Dhan and config must be ready before a backtest")
     frames: list[pd.DataFrame] = []
-    for chunk_start, chunk_end in _date_chunks(start, end):
+    errors: list[str] = []
+    # Dhan allows up to 30 days per rolling-option call.
+    for chunk_start, chunk_end in _date_chunks(start, end, days=30):
         try:
             response = BROKER.dhan.expired_options_data(
-                security_id=str(STATE.underlying_security_id),
+                security_id=int(str(STATE.underlying_security_id)),
                 exchange_segment=sdk_value(CONFIG.option_segment),
                 instrument_type="OPTIDX",
                 expiry_flag="WEEK",
@@ -4077,31 +4149,45 @@ def _fetch_rolling_option_history(
                 to_date=chunk_end.isoformat(),
                 interval=int(interval),
             )
-            frame = _candles_from_payload(unwrap_sdk_data(response))
+            if isinstance(response, dict) and response.get("status") == "failure":
+                remarks = response.get("remarks")
+                errors.append(str(remarks or "rolling-option failure"))
+                continue
+            frame = _option_candles_from_rolling_payload(unwrap_sdk_data(response), drv_option_type)
             if not frame.empty:
                 frames.append(frame)
-        except Exception:
-            pass
+            else:
+                errors.append(
+                    f"No {drv_option_type} OHLC in rolling-option response "
+                    f"for {chunk_start.isoformat()} to {chunk_end.isoformat()}"
+                )
+        except Exception as exc:
+            errors.append(str(exc))
         time.sleep(0.25)
     data = _concat_candles(frames)
     if data.empty:
+        if errors:
+            note(f"Rolling option history empty: {errors[-1]}")
         return data
     stamps = data["timestamp"].map(lambda value: value.date())
     return data[(stamps >= start) & (stamps <= end)].reset_index(drop=True)
 
 
 def _current_option_lot(master: pd.DataFrame) -> int:
-    """Read one current index-option lot size. It is not a historical lot."""
+    """Read one current index-option lot size for the configured underlying."""
     if CONFIG is None:
         raise RuntimeError("Config is not loaded")
     spec = underlying_spec(CONFIG.underlying)
     exchange = master["SEM_EXM_EXCH_ID"].astype(str).str.upper().str.strip()
     instrument = master["SEM_INSTRUMENT_NAME"].astype(str).str.upper().str.strip()
     option_type = master["SEM_OPTION_TYPE"].astype(str).str.upper().str.strip()
+    symbol = master["SEM_TRADING_SYMBOL"].astype(str).str.upper().str.strip()
+    prefix = f"{CONFIG.underlying}-"
     rows = master[
         (exchange == spec["option_exchange"])
         & instrument.eq("OPTIDX")
         & option_type.isin({"CE", "CALL"})
+        & symbol.str.startswith(prefix)
     ]
     if rows.empty:
         raise RuntimeError(f"Security master has no {CONFIG.underlying} option lot size")
@@ -4246,7 +4332,8 @@ def _run_backtest_loop(
             stopped = "Backtest stopped after TP/SL because stop_bot_after_tp_sl is true."
         if day_realized <= -abs(CONFIG.max_loss_per_day_inr):
             loss_lock = True
-            stopped = "Backtest stopped because combined daily gross P&L reached the loss limit."
+            if CONFIG.no_reentry_after_max_loss and CONFIG.stop_bot_after_tp_sl:
+                stopped = "Backtest stopped because combined daily gross P&L reached the loss limit."
 
     for index in range(len(signal_frame)):
         if stopped:
@@ -4263,8 +4350,7 @@ def _run_backtest_loop(
             day_realized = 0.0
             orders_today = 0
             stop_lock = False
-            if loss_lock:
-                break
+            loss_lock = False
         clock = when.timetz().replace(tzinfo=None)
         session_open = CONFIG.run_mode == "CONTINUOUS" or (start_clock <= clock < stop_clock)
         window = signal_frame.iloc[: index + 1]
@@ -4314,8 +4400,7 @@ def _run_backtest_loop(
             continue
         if day_realized <= -abs(CONFIG.max_loss_per_day_inr):
             loss_lock = True
-            stopped = "Backtest stopped because combined daily gross P&L reached the loss limit."
-            break
+            continue
         if CONFIG.candle_mode == "RENKO":
             direction = generate_renko_signal(window)
         else:
@@ -4355,7 +4440,8 @@ def run_backtest() -> None:
         Test the same signal and TP/SL rules on completed history.
 
     Inputs:
-        config.yaml backtest dates, candle mode, and option selection.
+        test.yaml backtest dates, candle mode, and option selection, loaded
+        through backtest.py with for_backtest=True.
 
     Output:
         A printed SIMULATED / HISTORICAL summary, then the process exits.
@@ -4417,21 +4503,21 @@ def run_backtest() -> None:
 
 
 def main() -> None:
-    """Load configuration, connect to Dhan, and either backtest or poll.
+    """Load configuration, connect to Dhan, and poll in PAPER or LIVE mode.
 
     Purpose:
-        Start the bot.
+        Start the live/paper bot.
 
     Inputs:
         config.yaml and .env beside this file.
 
     Output:
-        BACKTEST prints a historical summary and exits.
-        PAPER and LIVE run until a shutdown reason exits the process.
+        Runs until a shutdown reason exits the process.
 
     Trading use:
-        PAPER and BACKTEST never reach the live order call. LIVE can place
-        real orders after startup validation and an on-screen preview.
+        PAPER never reaches the live order call. LIVE can place real orders
+        after startup validation and an on-screen preview. Historical replay
+        is started with backtest.py and test.yaml, not this entry point.
     """
     global CONFIG, BROKER
     try:
@@ -4439,9 +4525,6 @@ def main() -> None:
         CONFIG = load_config()
         client_id, access_token = load_environment()
         BROKER = create_dhan_client(client_id, access_token)
-        if CONFIG.trading_mode == "BACKTEST":
-            run_backtest()
-            return
         startup_checks()
         render_startup()
         while True:

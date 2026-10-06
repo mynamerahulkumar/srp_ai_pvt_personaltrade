@@ -1,0 +1,110 @@
+# Half Trend RENKO historical backtest (1 month, continuous).
+# Used only by: python backtest.py
+# Tuned on 2026-09 SENSEX history for fewer, larger bricks + stricter RSI.
+# Past month profit does NOT guarantee future profit (overfitting risk).
+# Credentials still come from .env.
+
+# ============================================================
+# MARKET
+# ============================================================
+
+underlying: "SENSEX"
+
+candle_mode: "RENKO"
+
+timeframe_minutes: 1           # Renko is built from 1-minute closes
+
+polling_seconds: 5
+
+# ============================================================
+# STRATEGY (HalfTrend + RSI on completed Renko bricks)
+# ============================================================
+
+halftrend:
+  amplitude: 2
+  channel_deviation: 2
+  sideways_filter_enabled: true
+  sideways_lookback: 3
+  sideways_tolerance_points: 125   # ≈ one brick; skip flat HalfTrend
+
+rsi:
+  enabled: true
+  period: 14
+  bullish_min: 55              # Stricter than 50 — fewer weak CE entries
+  bearish_max: 45              # Stricter than 50 — fewer weak PE entries
+
+# ============================================================
+# RENKO
+# ============================================================
+
+renko:
+  brick_size_points: 125       # Larger brick → less noise than 50
+  entry_confirmation_bricks: 2 # Need 2 qualifying bricks before entry
+  exit_confirmation_bricks: 2  # Exit after 2 opposite-side bricks
+
+# ============================================================
+# OPTIONS
+# ============================================================
+
+option:
+  expiry_mode: "NEAREST"
+  expiry: ""
+  selection_mode: "ATM"
+  strike_offset: 0
+  target_premium: 100
+  premium_tolerance: 20
+  lots: 1
+
+# ============================================================
+# ORDER EXECUTION
+# ============================================================
+
+execution:
+  order_type: "LIMIT"
+  product_type: "INTRADAY"
+
+# ============================================================
+# RISK (TP ≈ 2 bricks, SL ≈ 1 brick)
+# ============================================================
+
+risk:
+  tp_sl_mode: "UNDERLYING_POINTS"
+  take_profit:
+    enabled: true
+    points: 250                # 2 × brick_size_points
+  stop_loss:
+    enabled: true
+    points: 125                # 1 × brick_size_points
+  stop_bot_after_tp_sl: false
+  max_open_strategies: 1
+  max_orders_per_day: 50
+  max_loss_per_day_inr: 5000
+  no_reentry_after_stop_loss: false
+  no_reentry_after_max_loss: false
+  exit_on_opposite_signal: true
+
+# ============================================================
+# SESSION
+# ============================================================
+
+timezone: "Asia/Kolkata"
+run_mode: "SCHEDULED"
+start_time: "09:20"
+stop_time: "15:20"
+close_all_positions_at_stop: true
+stop_bot_after_close: false
+
+# ============================================================
+# MARKET-CLOSE MONITORING
+# ============================================================
+
+post_close_polls: 3
+post_close_poll_seconds: 10
+
+# ============================================================
+# BACKTEST RANGE (1 month)
+# ============================================================
+
+backtest:
+  start_date: "2026-09-01"
+  end_date: "2026-09-30"

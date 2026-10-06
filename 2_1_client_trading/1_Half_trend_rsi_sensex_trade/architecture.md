@@ -13,23 +13,25 @@ The default index is SENSEX. NIFTY and BANKNIFTY are configurable in `config.yam
 
 Trading modes:
 
-- `PAPER` — same strategy as LIVE, simulated fills, never calls `place_order`
-- `LIVE` — real Dhan orders after a printed preview
-- `BACKTEST` — historical replay with Dhan minute and rolling-option data, then exit
+- `PAPER` — same strategy as LIVE, simulated fills, never calls `place_order` (`python main.py` + `config.yaml`)
+- `LIVE` — real Dhan orders after a printed preview (`python main.py` + `config.yaml`)
+- Historical backtest — `python backtest.py` + `test.yaml` (never places orders)
 
-`config.yaml` is the only trading configuration. `.env` holds only credentials. Default mode is PAPER.
+`config.yaml` is PAPER/LIVE trading configuration only. Historical parameters live in `test.yaml`. `.env` holds only credentials. Default live mode is PAPER.
 
 Take profit and stop loss default to **underlying index points**, not option-premium percent. Combined gross P&L is this algo’s closed trades plus the open option. It is not the whole Dhan account.
 
-There is no database, web UI, second broker, or extra strategy module. Application logic lives in `main.py`.
+There is no database, web UI, or second broker. Live/paper logic and the shared backtest engine live in `main.py`. `backtest.py` is a thin entry point.
 
 Actual performance depends on market conditions, execution, liquidity, costs, slippage, and parameter selection. This document does not claim the strategy is profitable.
 
 ## 2. Project Structure
 
 ```text
-main.py              All bot logic
-config.yaml          Trading settings only
+main.py              Live/paper bot + shared backtest engine
+backtest.py          Historical entry point (loads test.yaml)
+config.yaml          PAPER / LIVE settings only
+test.yaml            Backtest strategy + date range
 .env                 DHAN_CLIENT_ID, DHAN_ACCESS_TOKEN
 env.example          Credential template
 stop.py              Creates .bot_stop for graceful exit
@@ -41,20 +43,20 @@ docs/                Reference only; not imported at runtime
 
 ## 3. Configuration
 
-Every trading parameter is read from `config.yaml`. Nothing is duplicated as a Python constant for trader settings.
+PAPER/LIVE parameters are read from `config.yaml`. Backtest parameters are read from `test.yaml`. Nothing is duplicated as a Python constant for trader settings.
 
 Important groups:
 
 | Group | Role |
 |-------|------|
-| `trading_mode` | PAPER / LIVE / BACKTEST |
+| `trading_mode` | PAPER / LIVE in `config.yaml` only |
 | `candle_mode` | NORMAL or RENKO |
 | `halftrend` | Amplitude, channel, sideways filter |
 | `rsi` | Optional entry filter |
 | `renko` | Brick size and confirmation counts |
 | `option` | Expiry, ATM/ITM/OTM/PREMIUM, lots |
 | `risk` | TP/SL mode and points, daily limits |
-| `backtest` | Historical date range |
+| `backtest` | Date range in `test.yaml` only |
 
 Dropped from the older schema: `holding_mode`, `signal_confirmation`, premium `PERCENT`/`ABSOLUTE`, and `session.enabled`. `run_mode: SCHEDULED` with `start_time` / `stop_time` replaces the session switch. `product_type` remains the Dhan product (`INTRADAY` or `MARGIN`).
 
@@ -207,7 +209,9 @@ Validates credentials and contract, prints a full order preview, submits, polls 
 
 ## 19. BACKTEST Mode
 
-Loads `backtest.start_date` … `end_date` via `intraday_minute_data` (chunked). Renko uses 1-minute closes. Option P&L uses `expired_options_data` (rolling option) for ATM/ITM/OTM strike codes.
+Run with `python backtest.py`. Settings come from `test.yaml` (not `config.yaml`). There is no `trading_mode` in `test.yaml`; the entry point always forces BACKTEST.
+
+Loads `backtest.start_date` … `end_date` via `intraday_minute_data` (chunked). Renko uses 1-minute closes. Option P&L uses `expired_options_data` (rolling option) for ATM/ITM/OTM strike codes. Switch `candle_mode` in `test.yaml` between `NORMAL` and `RENKO` to test either chart path.
 
 Hard stops without inventing premium:
 
@@ -362,8 +366,9 @@ Keep dependencies minimal (`requirements.txt`). Hold only recent candles in PAPE
 
 ## 37. Final Implementation Notes
 
-- All strategy paths stay in `main.py`
-- PAPER and BACKTEST never place live orders
+- Strategy and the shared replay engine stay in `main.py`
+- `python main.py` is PAPER/LIVE only; `python backtest.py` uses `test.yaml`
+- PAPER and backtest never place live orders
 - HalfTrend is a transparent standard-style formula, not a Dhan clone claim
 - Gross P&L is educational and operational, not net of charges
 - Switch `trading_mode` to LIVE only after reviewing `config.yaml`

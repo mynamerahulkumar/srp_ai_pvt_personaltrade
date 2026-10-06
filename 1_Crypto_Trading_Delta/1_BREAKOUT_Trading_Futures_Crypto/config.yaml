@@ -15,7 +15,7 @@ mode: "LIVE"
 leverage: 25
 
 # Number of contracts/orders for each entry
-order_size: 2
+order_size: 5
 
 # market_order is recommended for the simple default execution
 # limit_order can be implemented if fully supported

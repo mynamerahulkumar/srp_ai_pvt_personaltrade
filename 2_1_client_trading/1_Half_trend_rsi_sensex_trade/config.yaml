@@ -1,11 +1,12 @@
-# Half Trend options bot. This file is the only trading configuration.
+# Half Trend options bot. This file is the only PAPER/LIVE trading configuration.
 # Credentials belong in .env, not here.
+# Historical runs use test.yaml via: python backtest.py
 
 # ============================================================
 # TRADING MODE
 # ============================================================
 
-trading_mode: "PAPER"          # PAPER | LIVE | BACKTEST
+trading_mode: "PAPER"          # PAPER | LIVE
 
 # ============================================================
 # MARKET
@@ -103,11 +104,3 @@ stop_bot_after_close: true
 
 post_close_polls: 3
 post_close_poll_seconds: 10
-
-# ============================================================
-# BACKTEST
-# ============================================================
-
-backtest:
-  start_date: "2026-01-01"
-  end_date: "2026-09-30"
