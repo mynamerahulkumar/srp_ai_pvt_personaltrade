@@ -91,7 +91,7 @@ take_profit:
 
   # PNL = dollars
   # PERCENT = percentage from entry price
-  value: 4
+  value: 5
 
 stop_loss:
   enabled: true
@@ -101,7 +101,7 @@ stop_loss:
 
   # Positive dollar amount when mode = PNL
   # Example 5 means exit around -$5
-  value: 2
+  value: 3
 
 # Stop after TP/SL exit
 stop_after_tp: false
@@ -120,7 +120,7 @@ day_trading_enabled: true
 # RISK LIMITS
 # ------------------------------------------------------------
 
-max_open_strategies: 5
+max_open_strategies: 1
 
 max_orders_per_day: 20
 
@@ -133,4 +133,4 @@ max_loss_per_day_dollar: 10
 # ------------------------------------------------------------
 
 # false = do not immediately re-enter after an exit
-allow_reentry_after_exit: true
+allow_reentry_after_exit: false
