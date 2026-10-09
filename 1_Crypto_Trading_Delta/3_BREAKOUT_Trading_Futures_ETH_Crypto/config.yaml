@@ -1,0 +1,136 @@
+# ============================================================
+# DELTA CRYPTO BREAKOUT BOT
+# User trading configuration
+# ============================================================
+
+# Delta perpetual futures symbol
+# Examples: BTCUSD, ETHUSD, SOLUSD, XAUSD, XAUTUSD
+symbol: "BTCUSD"
+
+# PAPER = simulated trading
+# LIVE  = real trading
+mode: "LIVE"
+
+# Leverage requested for the selected futures product
+leverage: 25
+
+# Number of contracts/orders for each entry
+order_size: 5
+
+# market_order is recommended for the simple default execution
+# limit_order can be implemented if fully supported
+order_type: "market_order"
+
+# How often the bot polls the exchange
+polling_seconds: 5
+
+# Candle timeframe used by the breakout strategy
+# Examples: 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d
+timeframe: "1h"
+
+# ------------------------------------------------------------
+# RUNNING MODE
+# ------------------------------------------------------------
+
+# CONTINUOUS = start immediately and trade while main.py runs
+# SCHEDULED  = trade only inside start_time / stop_time
+run_mode: "CONTINUOUS"
+
+timezone: "Asia/Kolkata"
+
+# Used only when run_mode = SCHEDULED
+start_time: "09:30"
+stop_time: "23:00"
+
+# If true, close this strategy's open position at stop_time
+close_positions_at_stop_time: false
+
+# After the scheduled position is closed, exit Python
+stop_bot_after_close: true
+
+# ------------------------------------------------------------
+# BREAKOUT STRATEGY
+# ------------------------------------------------------------
+
+strategy:
+  enabled: true
+
+  # Completed candles of `timeframe` used for the breakout range.
+  # 1 = the previous completed candle (5m = previous 5m bar, 1d = previous day).
+  breakout_lookback_candles: 1
+
+  # LONG, SHORT or BOTH
+  direction: "BOTH"
+
+# ------------------------------------------------------------
+# BREAKOUT CONFIRMATION
+# ------------------------------------------------------------
+
+confirmation:
+  enabled: true
+
+  # POINTS or PERCENT
+  mode: "POINTS"
+
+  # Example: 50 points above/below breakout range
+  value: 150
+
+  # true  = wait for a completed candle close beyond the level
+  # false = enter when the live price crosses the level
+  candle_close_confirmation: false
+
+# ------------------------------------------------------------
+# TP / SL
+# ------------------------------------------------------------
+
+take_profit:
+  enabled: true
+
+  # PNL or PERCENT
+  mode: "PNL"
+
+  # PNL = dollars
+  # PERCENT = percentage from entry price
+  value: 5
+
+stop_loss:
+  enabled: true
+
+  # PNL or PERCENT
+  mode: "PNL"
+
+  # Positive dollar amount when mode = PNL
+  # Example 5 means exit around -$5
+  value: 3
+
+# Stop after TP/SL exit
+stop_after_tp: false
+stop_after_sl: false
+
+# ------------------------------------------------------------
+# TRADING STYLE
+# ------------------------------------------------------------
+
+# true  = enforce scheduled/day-trading behavior
+# false = allow the strategy to continue without an artificial
+#         intraday restriction
+day_trading_enabled: true
+
+# ------------------------------------------------------------
+# RISK LIMITS
+# ------------------------------------------------------------
+
+max_open_strategies: 1
+
+max_orders_per_day: 20
+
+# If daily strategy loss reaches this amount,
+# block new entries and close active strategy position.
+max_loss_per_day_dollar: 10
+
+# ------------------------------------------------------------
+# RE-ENTRY
+# ------------------------------------------------------------
+
+# false = do not immediately re-enter after an exit
+allow_reentry_after_exit: false
