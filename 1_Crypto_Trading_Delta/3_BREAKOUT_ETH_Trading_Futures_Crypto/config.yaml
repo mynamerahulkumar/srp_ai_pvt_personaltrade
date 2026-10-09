@@ -72,8 +72,8 @@ confirmation:
   # POINTS or PERCENT
   mode: "POINTS"
 
-  # Example: 15 points above/below breakout range (ETH clear-trade buffer)
-  value: 15
+  # Example: 8 points above/below breakout range (ETH clear-trade buffer)
+  value: 8
 
   # true  = wait for a completed candle close beyond the level
   # false = enter when the live price crosses the level
