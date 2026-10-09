@@ -275,7 +275,7 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
     sl_raw = raw.get("stop_loss") or {}
 
     cfg = Config(
-        symbol=str(raw.get("symbol", "BTCUSD")).strip().upper(),
+        symbol=str(raw.get("symbol", "ETHUSD")).strip().upper(),
         mode=str(raw.get("mode", "PAPER")).strip().upper(),
         leverage=int(raw.get("leverage", 100)),
         order_size=int(raw.get("order_size", 1)),

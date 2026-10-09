@@ -5,14 +5,14 @@
 
 # Delta perpetual futures symbol
 # Examples: BTCUSD, ETHUSD, SOLUSD, XAUSD, XAUTUSD
-symbol: "BTCUSD"
+symbol: "ETHUSD"
 
 # PAPER = simulated trading
 # LIVE  = real trading
 mode: "LIVE"
 
 # Leverage requested for the selected futures product
-leverage: 25
+leverage: 10
 
 # Number of contracts/orders for each entry
 order_size: 5
@@ -72,8 +72,8 @@ confirmation:
   # POINTS or PERCENT
   mode: "POINTS"
 
-  # Example: 50 points above/below breakout range
-  value: 150
+  # Example: 15 points above/below breakout range (ETH clear-trade buffer)
+  value: 15
 
   # true  = wait for a completed candle close beyond the level
   # false = enter when the live price crosses the level
@@ -91,7 +91,7 @@ take_profit:
 
   # PNL = dollars
   # PERCENT = percentage from entry price
-  value: 5
+  value: 2
 
 stop_loss:
   enabled: true
@@ -101,7 +101,7 @@ stop_loss:
 
   # Positive dollar amount when mode = PNL
   # Example 5 means exit around -$5
-  value: 3
+  value: 1
 
 # Stop after TP/SL exit
 stop_after_tp: false
