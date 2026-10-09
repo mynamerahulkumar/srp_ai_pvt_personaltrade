@@ -610,6 +610,8 @@ class Runtime:
     scheduled_close_done: bool = False
     daily_loss_announced: bool = False
     last_day_sync_ts: float = 0.0
+    account_open_unrealized: float = 0.0
+    last_account_positions_ts: float = 0.0
     startup_breakout_checked: bool = False
     resume_after_candle_open: int | None = None
     flat_orders_need_cancel: bool = False
@@ -804,13 +806,12 @@ class DeltaClient:
             params={"symbol": symbol, "resolution": resolution, "start": start, "end": end},
         )
 
-    def get_positions(self, product_id: int) -> dict[str, Any]:
-        return self.send_request(
-            "GET",
-            "/positions/margined",
-            params={"product_ids": str(product_id)},
-            auth=True,
-        )
+    def get_positions(self, product_id: int | None = None) -> dict[str, Any]:
+        """Margined positions. Omit product_id to list the whole account."""
+        params: dict[str, Any] | None = None
+        if product_id is not None:
+            params = {"product_ids": str(product_id)}
+        return self.send_request("GET", "/positions/margined", params=params, auth=True)
 
     def get_open_orders(self, product_id: int) -> dict[str, Any]:
         return self.send_request(
@@ -1352,9 +1353,12 @@ def _paginate_wallet_transactions(app: App, start_us: int, end_us: int) -> list[
 
 
 def _exchange_day_realized(app: App) -> float | None:
-    """Sum IST-day wallet cashflow+commission+funding for this product. None on failure."""
-    product = app.runtime.product
-    if product is None or not app.env.has_credentials:
+    """Sum IST-day wallet cashflow+commission+funding for the whole account.
+
+    Includes every product (BTCUSD, ETHUSD, …) so max_loss_per_day is shared
+    across algos on the same Delta key. None on failure.
+    """
+    if not app.env.has_credentials:
         return None
     start_us, end_us = _ist_day_bounds_us(app.cfg)
     try:
@@ -1365,18 +1369,7 @@ def _exchange_day_realized(app: App) -> float | None:
         log_event(app.runtime, f"DAY SYNC FAILED {exc}", logging.WARNING)
         return None
     total = 0.0
-    pid = product.product_id
-    symbol = product.symbol
     for row in rows:
-        row_pid = _to_int(row.get("product_id"))
-        meta = row.get("meta_data") if isinstance(row.get("meta_data"), dict) else {}
-        row_sym = str(meta.get("product_symbol") or row.get("product_symbol") or "")
-        if row_pid is not None and row_pid != pid:
-            continue
-        if row_pid is None and row_sym and row_sym != symbol:
-            continue
-        if row_pid is None and not row_sym:
-            continue
         amount = _to_float(row.get("amount"))
         if amount is None:
             continue
@@ -1385,7 +1378,7 @@ def _exchange_day_realized(app: App) -> float | None:
 
 
 def _sync_daily_realized_from_exchange(app: App, *, force: bool = False) -> bool:
-    """Overwrite local day realized with Delta wallet totals for this IST day.
+    """Overwrite local day realized with account-wide Delta wallet totals for this IST day.
 
     Exchange is the LIVE source of truth for the daily-loss gate. A successful
     sync never leaves a more-negative stale local value in place.
@@ -1510,8 +1503,14 @@ def refresh_trading_day(app: App) -> None:
         _sync_daily_realized_from_exchange(app, force=True)
 
 
-def daily_pnl_total(app: App, open_unrealized: float) -> float:
-    """Closed IST-day realized plus open mark unrealized. Not for TP/SL."""
+def daily_pnl_total(app: App, open_unrealized: float | None = None) -> float:
+    """Account IST-day realized plus open unrealized. Not for TP/SL.
+
+    When open_unrealized is omitted, uses the cached account-wide open PnL
+    (all margined products). Pass an explicit value only for paper/tests.
+    """
+    if open_unrealized is None:
+        open_unrealized = app.runtime.account_open_unrealized
     return app.runtime.daily_realized_pnl + open_unrealized
 
 
@@ -1707,7 +1706,7 @@ def open_strategy_count(app: App) -> int:
     return 1 if app.runtime.position is not None else 0
 
 
-def validate_risk_conditions(app: App, unrealized: float) -> str | None:
+def validate_risk_conditions(app: App, unrealized: float | None = None) -> str | None:
     """Return a human reason if new entries are forbidden by risk limits."""
     if not app.cfg.strategy.enabled:
         return "STRATEGY DISABLED"
@@ -1795,6 +1794,14 @@ def _order_result_dict(payload: Any) -> dict[str, Any]:
     return raw if isinstance(raw, dict) else {}
 
 
+def _position_rows_from_payload(raw: Any) -> list[dict[str, Any]]:
+    if isinstance(raw, list):
+        return [r for r in raw if isinstance(r, dict)]
+    if isinstance(raw, dict):
+        return [raw]
+    return []
+
+
 def get_current_position(app: App) -> dict[str, Any] | None:
     """Fetch this product's exchange position. Never inspect unrelated symbols."""
     if app.runtime.product is None:
@@ -1802,13 +1809,7 @@ def get_current_position(app: App) -> dict[str, Any] | None:
     if not app.env.has_credentials:
         return None
     raw = _unwrap(app.client.get_positions(app.runtime.product.product_id))
-    rows: list[dict[str, Any]]
-    if isinstance(raw, list):
-        rows = [r for r in raw if isinstance(r, dict)]
-    elif isinstance(raw, dict):
-        rows = [raw]
-    else:
-        rows = []
+    rows = _position_rows_from_payload(raw)
     pid = app.runtime.product.product_id
     symbol = app.runtime.product.symbol
     for row in rows:
@@ -1821,10 +1822,53 @@ def get_current_position(app: App) -> dict[str, Any] | None:
     return None
 
 
-def get_open_orders(app: App) -> list[dict[str, Any]]:
-    if app.runtime.product is None or not app.env.has_credentials:
+def list_open_margined_positions(app: App) -> list[dict[str, Any]]:
+    """All non-zero margined futures on the account (every product)."""
+    if not app.env.has_credentials:
         return []
-    raw = _unwrap(app.client.get_open_orders(app.runtime.product.product_id))
+    raw = _unwrap(app.client.get_positions(None))
+    open_rows: list[dict[str, Any]] = []
+    for row in _position_rows_from_payload(raw):
+        size = _to_int(row.get("size"), 0) or 0
+        if size != 0:
+            open_rows.append(row)
+    return open_rows
+
+
+def refresh_account_open_unrealized(app: App, *, force: bool = False) -> float:
+    """Cache sum of unrealized PnL across all open margined positions."""
+    if app.cfg.mode != "LIVE" or not app.env.has_credentials:
+        app.runtime.account_open_unrealized = _snapshot_unrealized(app)
+        return app.runtime.account_open_unrealized
+    now = time.time()
+    if not force and now - app.runtime.last_account_positions_ts < 15.0:
+        return app.runtime.account_open_unrealized
+    try:
+        rows = list_open_margined_positions(app)
+    except DeltaAPIError as exc:
+        app.runtime.api_ok = False
+        app.runtime.last_error = str(exc)
+        log_event(app.runtime, f"ACCOUNT OPEN PNL FETCH FAILED {exc}", logging.WARNING)
+        return app.runtime.account_open_unrealized
+    total = 0.0
+    for row in rows:
+        pnl = _exchange_unrealized(row)
+        if pnl is not None:
+            total += pnl
+    app.runtime.account_open_unrealized = total
+    app.runtime.last_account_positions_ts = now
+    return total
+
+
+def get_open_orders(app: App, product_id: int | None = None) -> list[dict[str, Any]]:
+    if not app.env.has_credentials:
+        return []
+    pid = product_id
+    if pid is None:
+        if app.runtime.product is None:
+            return []
+        pid = app.runtime.product.product_id
+    raw = _unwrap(app.client.get_open_orders(pid))
     if isinstance(raw, list):
         return [r for r in raw if isinstance(r, dict)]
     if isinstance(raw, dict):
@@ -2085,13 +2129,10 @@ def _place_separate_exit_orders(app: App, tp_price: float | None, sl_price: floa
     return placed
 
 
-def cancel_product_orders(app: App) -> None:
-    """Cancel resting orders on this product before a bot-driven market flatten."""
-    product = app.runtime.product
-    if product is None:
-        return
+def cancel_orders_for_product(app: App, product_id: int) -> None:
+    """Cancel open/pending orders for one product_id."""
     try:
-        orders = get_open_orders(app)
+        orders = get_open_orders(app, product_id)
     except DeltaAPIError as exc:
         log_event(app.runtime, f"OPEN ORDER LOOKUP FAILED {exc}", logging.WARNING)
         return
@@ -2100,9 +2141,17 @@ def cancel_product_orders(app: App) -> None:
         if order_id is None:
             continue
         try:
-            app.client.cancel_order(product_id=product.product_id, order_id=order_id)
+            app.client.cancel_order(product_id=product_id, order_id=order_id)
         except DeltaAPIError as exc:
             log_event(app.runtime, f"CANCEL ORDER {order_id} FAILED {exc}", logging.WARNING)
+
+
+def cancel_product_orders(app: App) -> None:
+    """Cancel resting orders on this product before a bot-driven market flatten."""
+    product = app.runtime.product
+    if product is None:
+        return
+    cancel_orders_for_product(app, product.product_id)
 
 
 def _bracket_exit_reason(pos: StrategyPosition, price: float) -> str:
@@ -2215,8 +2264,58 @@ def place_exit_order(app: App, reason: str, last_price: float) -> float | None:
 
 
 def close_strategy_position(app: App, reason: str, last_price: float) -> float | None:
-    """Reduce-only close of this bot's product. Never account-wide flatten."""
+    """Reduce-only close of this bot's product."""
     return place_exit_order(app, reason, last_price)
+
+
+def flatten_all_account_positions(app: App, reason: str = "DAILY LOSS") -> None:
+    """Reduce-only market-close every open margined futures position on the account.
+
+    Used when the shared IST day-loss limit is breached. PAPER only closes the
+    local strategy position. LIVE cancels each product's open orders first.
+    """
+    if app.cfg.mode == "PAPER" or not app.env.has_credentials:
+        if app.runtime.position is not None:
+            close_strategy_position(app, reason, app.runtime.current_price or 0.0)
+        return
+    if app.runtime.position is not None:
+        close_strategy_position(app, reason, app.runtime.current_price or 0.0)
+    try:
+        rows = list_open_margined_positions(app)
+    except DeltaAPIError as exc:
+        log_event(app.runtime, f"FLATTEN LIST FAILED {exc}", logging.ERROR)
+        return
+    for row in rows:
+        size = _to_int(row.get("size"), 0) or 0
+        if size == 0:
+            continue
+        product_obj = row.get("product") if isinstance(row.get("product"), dict) else {}
+        pid = _to_int(row.get("product_id") or product_obj.get("id"))
+        symbol = str(
+            row.get("product_symbol")
+            or product_obj.get("symbol")
+            or ""
+        ).strip().upper()
+        if not symbol or pid is None:
+            log_event(app.runtime, f"FLATTEN SKIP incomplete row size={size}", logging.WARNING)
+            continue
+        cancel_orders_for_product(app, pid)
+        side = "sell" if size > 0 else "buy"
+        qty = abs(size)
+        coid = _client_order_id("f", f"{reason}-{symbol}-{pid}")
+        try:
+            app.client.place_order(
+                size=qty,
+                side=side,
+                order_type="market_order",
+                product_symbol=symbol,
+                reduce_only=True,
+                client_order_id=coid,
+            )
+            log_event(app.runtime, f"{reason} FLATTEN {symbol} size={qty} side={side}")
+        except DeltaAPIError as exc:
+            log_event(app.runtime, f"FLATTEN {symbol} FAILED {exc}", logging.ERROR)
+    refresh_account_open_unrealized(app, force=True)
 
 
 def verify_position_closed(app: App) -> bool:
@@ -2397,7 +2496,8 @@ def _status_payload(app: App) -> dict[str, Any]:
         "has_position": pos is not None,
         "unrealized": unrealized if pos is not None else 0.0,
         "daily_realized": rt.daily_realized_pnl,
-        "daily_pnl": daily_pnl_total(app, unrealized if pos is not None else 0.0),
+        "account_open_unrealized": rt.account_open_unrealized,
+        "daily_pnl": daily_pnl_total(app),
         "daily_orders": rt.daily_orders,
         "max_orders": cfg.max_orders_per_day,
         "tp_pnl": tp_pnl,
@@ -2550,7 +2650,7 @@ def render_status_panel(payload: dict[str, Any] | None = None, *, status_check: 
                 pos_table.add_row("DISTANCE TO SL", _px(abs(sl_price - current), digits))
         else:
             pos_table.add_row("SL TARGET", _money(-sl_pnl) if sl_pnl is not None else "—")
-    open_pnl = unrealized if payload.get("has_position") else 0.0
+    open_pnl = _to_float(payload.get("account_open_unrealized"), 0.0) or 0.0
     daily_realized = _to_float(payload.get("daily_realized"), _to_float(payload.get("daily_pnl"), 0.0))
     day_total = _to_float(payload.get("daily_pnl"), 0.0)
     if daily_realized is None:
@@ -2558,7 +2658,7 @@ def render_status_panel(payload: dict[str, Any] | None = None, *, status_check: 
     if day_total is None:
         day_total = daily_realized + open_pnl
     pos_table.add_row("DAILY REALIZED", _money(daily_realized))
-    pos_table.add_row("OPEN PNL", _money(open_pnl, 4) if payload.get("has_position") else _money(0.0))
+    pos_table.add_row("OPEN PNL", _money(open_pnl, 4))
     pos_table.add_row("DAY TOTAL", _money(day_total))
     pos_table.add_row("DAILY ORDERS", f"{payload.get('daily_orders', 0)}/{payload.get('max_orders', 0)}")
 
@@ -2913,24 +3013,15 @@ def manage_open_position(app: App, last_price: float, mark_price: float) -> None
     app.runtime.exchange_unrealized = _exchange_unrealized(exchange_row)
     app.runtime.current_price = last_price
     app.runtime.mark_price = mark_price
-    open_unrealized = (
-        app.runtime.exchange_unrealized
-        if app.runtime.exchange_unrealized is not None and not pos.paper
-        else calculate_position_pnl(pos, mark_price, product.contract_value)
-    )
-
-    day_total = daily_pnl_total(app, open_unrealized)
+    refresh_account_open_unrealized(app)
+    day_total = daily_pnl_total(app)
     if day_total <= -app.cfg.max_loss_per_day_dollar:
-        _sync_daily_realized_from_exchange(app, force=False)
-        open_unrealized = (
-            app.runtime.exchange_unrealized
-            if app.runtime.exchange_unrealized is not None and not pos.paper
-            else calculate_position_pnl(pos, mark_price, product.contract_value)
-        )
-        day_total = daily_pnl_total(app, open_unrealized)
+        _sync_daily_realized_from_exchange(app, force=True)
+        refresh_account_open_unrealized(app, force=True)
+        day_total = daily_pnl_total(app)
         if day_total <= -app.cfg.max_loss_per_day_dollar:
             _block_for_daily_loss(app)
-            close_strategy_position(app, "DAILY LOSS", last_price)
+            flatten_all_account_positions(app, "DAILY LOSS")
             return
 
     if not pos.bracket_placed and check_take_profit(app, strategy_pnl, mark_price):
@@ -3068,7 +3159,7 @@ def scan_for_entry(app: App, last_price: float, completed: list[Candle]) -> None
         app.runtime.entries_blocked_reason = entry_block
         app.runtime.status = "SCANNING"
         return
-    risk_block = validate_risk_conditions(app, 0.0)
+    risk_block = validate_risk_conditions(app)
     if risk_block:
         app.runtime.entries_blocked_reason = risk_block
         app.runtime.status = "SCANNING"
@@ -3183,14 +3274,18 @@ def run_poll(app: App) -> None:
         app.runtime.api_ok = False
         app.runtime.last_error = str(exc)
 
+    refresh_account_open_unrealized(app)
+
     if app.runtime.position is not None:
         manage_open_position(app, last_price, mark_price)
         return
 
-    if daily_pnl_total(app, 0.0) <= -app.cfg.max_loss_per_day_dollar:
-        _sync_daily_realized_from_exchange(app, force=False)
-        if daily_pnl_total(app, 0.0) <= -app.cfg.max_loss_per_day_dollar:
+    if daily_pnl_total(app) <= -app.cfg.max_loss_per_day_dollar:
+        _sync_daily_realized_from_exchange(app, force=True)
+        refresh_account_open_unrealized(app, force=True)
+        if daily_pnl_total(app) <= -app.cfg.max_loss_per_day_dollar:
             _block_for_daily_loss(app)
+            flatten_all_account_positions(app, "DAILY LOSS")
             return
 
     with app.runtime.candle_lock:
@@ -3329,6 +3424,7 @@ def main(preview_seconds: float | None = None, headless: bool = False) -> int:
             _load_day_ledger(app)
             _load_session_snapshot(app)
             _sync_daily_realized_from_exchange(app, force=True)
+            refresh_account_open_unrealized(app, force=True)
             log_event(runtime, f"BOT READY pid={os.getpid()}")
             _publish_status(app)
         except (ConfigError, DeltaAPIError) as exc:
