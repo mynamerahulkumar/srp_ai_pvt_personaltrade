@@ -15,7 +15,7 @@ mode: "LIVE"
 leverage: 10
 
 # Number of contracts/orders for each entry
-order_size: 5
+order_size: 15
 
 # market_order is recommended for the simple default execution
 # limit_order can be implemented if fully supported
@@ -91,7 +91,7 @@ take_profit:
 
   # PNL = dollars
   # PERCENT = percentage from entry price
-  value: 2
+  value: 5
 
 stop_loss:
   enabled: true
@@ -101,7 +101,7 @@ stop_loss:
 
   # Positive dollar amount when mode = PNL
   # Example 5 means exit around -$5
-  value: 1
+  value: 3
 
 # Stop after TP/SL exit
 stop_after_tp: false
