@@ -1,0 +1,8 @@
+.env
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+data/historical/*.csv
+data/backtest_results/**
+!data/backtest_results/.gitkeep

@@ -25,7 +25,7 @@ halftrend:
   channel_deviation: 2
   sideways_filter_enabled: true
   sideways_lookback: 3
-  sideways_tolerance_points: 125   # ≈ one brick; skip flat HalfTrend
+  sideways_tolerance_points: 62.5   # ≈ one brick; skip flat HalfTrend
 
 rsi:
   enabled: true
@@ -71,10 +71,10 @@ risk:
   tp_sl_mode: "UNDERLYING_POINTS"
   take_profit:
     enabled: true
-    points: 250                # 2 × brick_size_points
+    points: 125                # 2 × brick_size_points
   stop_loss:
     enabled: true
-    points: 125                # 1 × brick_size_points
+    points: 65                # 1 × brick_size_points
   stop_bot_after_tp_sl: false
   max_open_strategies: 1
   max_orders_per_day: 50

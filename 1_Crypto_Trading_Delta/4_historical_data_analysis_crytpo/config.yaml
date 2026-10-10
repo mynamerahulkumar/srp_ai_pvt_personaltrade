@@ -1,0 +1,17 @@
+# Historical candle download.
+# This application downloads candles locally.
+# It does not place, edit, or cancel exchange orders.
+
+exchange:
+  name: "delta_exchange_india"
+  base_url: "https://api.india.delta.exchange/v2"
+
+historical_data:
+  symbols:
+    - "BTCUSD"
+    - "ETHUSD"
+    - "SOLUSD"
+  interval: "1h"
+  days: 14
+  timezone: "Asia/Kolkata"
+  output_directory: "data/historical"
