@@ -12,6 +12,6 @@ historical_data:
     - "ETHUSD"
     - "SOLUSD"
   interval: "1h"
-  days: 14
+  days: 30
   timezone: "Asia/Kolkata"
   output_directory: "data/historical"

@@ -1,0 +1,64 @@
+# ============================================================
+# PAIRED BTC / ETH BREAKOUT BACKTEST
+# Read by backtest.py only. The live bot keeps using config.yaml.
+# ============================================================
+
+# BTCUSD is the signal. ETHUSD is entered in the same direction
+# and closed when the BTC leg hits take-profit or stop-loss.
+signal_symbol: "BTCUSD"
+pair_symbol: "ETHUSD"
+
+btc_csv: "data/historical/BTCUSD_1h.csv"
+eth_csv: "data/historical/ETHUSD_1h.csv"
+
+# Delta India perpetual specs. Dollar PnL =
+# price_change * order_size * contract_value
+products:
+  BTCUSD:
+    contract_value: 0.001
+    tick_size: 0.5
+  ETHUSD:
+    contract_value: 0.01
+    tick_size: 0.05
+
+# Contracts for each leg
+order_size: 5
+
+strategy:
+  # Completed candles used for the breakout range.
+  # 1 = the previous completed candle.
+  breakout_lookback_candles: 1
+
+  # LONG, SHORT or BOTH
+  direction: "BOTH"
+
+confirmation:
+  enabled: true
+
+  # POINTS or PERCENT
+  mode: "POINTS"
+
+  # Points beyond the previous candle high / low
+  value: 150
+
+  # true  = enter on a completed candle close beyond the level
+  # false = enter when the bar high/low crosses the level
+  candle_close_confirmation: false
+
+take_profit:
+  enabled: true
+
+  # PNL = dollars on the BTC leg. PERCENT = percent from the BTC entry.
+  mode: "PNL"
+  value: 5
+
+stop_loss:
+  enabled: true
+
+  # Positive dollar amount when mode = PNL. 3 means exit near -$3 on BTC.
+  mode: "PNL"
+  value: 3
+
+# Printed after the replay. The backtest does not stop taking
+# signals when a day reaches this loss.
+max_loss_per_day_dollar: 10
