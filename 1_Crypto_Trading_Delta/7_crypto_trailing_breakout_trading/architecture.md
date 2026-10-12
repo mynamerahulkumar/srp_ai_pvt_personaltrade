@@ -257,7 +257,7 @@ LONG  PnL = (mark − entry) × qty × contract_value
 SHORT PnL = (entry − mark) × qty × contract_value
 ```
 
-Paper always uses that formula. The dashboard still adds Kolkata-day realized and the open unrealized. The daily entry gate uses realized only.
+Paper always uses that formula. The dashboard still adds Kolkata-day realized and the open unrealized. The daily loss gate uses that same total.
 
 ---
 
@@ -292,11 +292,11 @@ stop_loss:
 
 trailing:
   enabled: true
-  activate_profit: 5
+  activate_profit: 4
   distance: 3
 ```
 
-The initial stop is a positive dollar amount on the loss side of the entry. With trailing on it stays there until the best unrealized profit reaches `activate_profit`. After that the stop is `best profit − distance`, and it only moves tighter. A peak of $8 with distance 3 exits at +$5. The best profit is remembered. The latest price is not used, because that would chase the stop down.
+The initial stop is a positive dollar amount on the loss side of the entry. With trailing on it stays there until the best unrealized profit reaches `activate_profit`. After that the stop is `best profit − distance`, and it only moves tighter. At a best profit of $4 with distance 3 the stop is +$1. A peak of $8 exits at +$5. The best profit is remembered. The latest price is not used, because that would chase the stop down.
 
 The stop is a reduce-only market order triggered on mark price. Each 1-second poll edits that order with `PUT /orders` only when the new price is at least one tick tighter. A failed edit leaves the previous stop working. If the stop cannot be rested or the edit fails and the trail level is already hit, the poll closes the position.
 
@@ -314,12 +314,12 @@ This is the trade stop. It is not the daily loss limit.
 max_loss_per_day_dollar: 10
 ```
 
-Trading day is `Asia/Kolkata`. If realized PnL for this product is ≤ −$10:
+Trading day is `Asia/Kolkata`. If realized plus open unrealized is ≤ −$10:
 
-1. New entries are blocked until the next IST midnight.
-2. The open trade is not closed. Its own stop, trail, and hard target keep running.
+1. This product's open position is closed.
+2. New entries are blocked until the next IST midnight.
 
-Open unrealized does not trip this gate. The process keeps running.
+A +$10 take-profit closes that trade and scanning continues the same day. It does not start this wait. The process keeps running.
 
 The dashboard prints `DAILY LOSS LIMIT REACHED` / `NEW TRADES BLOCKED`.
 
@@ -583,19 +583,19 @@ Range low 99000, buffer 50, close 98900 → SELL. State becomes SHORT. Same iden
 
 ## 41. TP Example
 
-Entry 100082, hard target +$10, size 1, contract value 0.001. The resting limit is 10,000 points above the fill. When that limit fills, the bot records the realized PnL and stops the process only if `stop_after_tp` is true.
+Entry 100082, hard target +$10, size 1, contract value 0.001. The resting limit is 10,000 points above the fill. When profit reaches +$10, the limit or the next poll closes the trade. The process keeps scanning the same day unless `stop_after_tp` is true.
 
 ---
 
 ## 42. SL Example
 
-Same position, initial stop $3, trail activates at $5 with a $3 give-back. Until the best profit reaches $5 the stop stays near −$3. At a best profit of $8 the stop is +$5. At +$10 the hard target exits.
+Same position, initial stop $3, trail activates at $4 with a $3 give-back. Until the best profit reaches $4 the stop stays near −$3. At $4 the stop is +$1. At a best profit of $8 the stop is +$5. At +$10 the hard target exits.
 
 ---
 
 ## 43. Daily Loss Limit Example
 
-Three closed losses of about $3.50 leave realized PnL at −$10.50. The limit is $10. The next entry is blocked until the next IST midnight. An open trade is not flattened by this limit. Its own stop still applies. A floating loss with realized PnL still above −$10 does not block the day.
+Realized −$8 plus an open trade at −$3 is −$11. The limit is $10. The open trade is closed and the next entry waits until the next IST midnight. A trade that hits +$10 is closed and the bot keeps scanning that same day. A single −$3 stop does not lock the day.
 
 ---
 

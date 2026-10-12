@@ -114,7 +114,7 @@ stop_loss:
 # profit, not the latest price. The hard exit remains take_profit.
 trailing:
   enabled: true
-  activate_profit: 5
+  activate_profit: 4
   distance: 3
 
 # Stop after TP/SL exit
@@ -138,8 +138,9 @@ max_open_strategies: 1
 
 max_orders_per_day: 20
 
-# If today's realized loss reaches this amount, block new entries
-# until the next Asia/Kolkata day. The open trade is left to its own stop.
+# If today's realized plus open loss reaches this amount, close the open
+# trade and block new entries until the next Asia/Kolkata day.
+# A +take_profit win closes that trade only and keeps scanning the same day.
 max_loss_per_day_dollar: 10
 
 # ------------------------------------------------------------

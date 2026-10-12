@@ -1636,18 +1636,14 @@ def refresh_trading_day(app: App) -> None:
 def daily_pnl_total(app: App, open_unrealized: float) -> float:
     """Closed IST-day realized plus open mark unrealized. Shown on the dashboard.
 
-    The new-entry gate uses realized only. See daily_loss_limit_reached.
+    The day-loss gate uses this total. A profit exit does not lock the day.
     """
     return app.runtime.daily_realized_pnl + open_unrealized
 
 
-def daily_loss_limit_reached(app: App) -> bool:
-    """True when today's realized loss has used up the daily stop.
-
-    Open unrealized is not included, so a floating loss does not flatten
-    the trade or block the day before the trade's own stop fills.
-    """
-    return app.runtime.daily_realized_pnl <= -app.cfg.max_loss_per_day_dollar
+def daily_loss_limit_reached(app: App, open_unrealized: float = 0.0) -> bool:
+    """True when today's realized plus open loss has reached the daily stop."""
+    return daily_pnl_total(app, open_unrealized) <= -app.cfg.max_loss_per_day_dollar
 
 
 def _book_realized_pnl(app: App, strategy_id: str, pnl: float) -> bool:
@@ -1935,7 +1931,7 @@ def open_strategy_count(app: App) -> int:
 def validate_risk_conditions(app: App, _unrealized: float) -> str | None:
     """Return a human reason if new entries are forbidden by risk limits.
 
-    The daily stop uses realized PnL only. Open profit is not an entry gate.
+    The daily stop uses realized plus this call's open unrealized.
     """
     if not app.cfg.strategy.enabled:
         return "STRATEGY DISABLED"
@@ -1943,7 +1939,7 @@ def validate_risk_conditions(app: App, _unrealized: float) -> str | None:
         return "MAX OPEN STRATEGIES"
     if app.runtime.daily_orders >= app.cfg.max_orders_per_day:
         return "MAX ORDERS PER DAY"
-    if daily_loss_limit_reached(app):
+    if daily_loss_limit_reached(app, _unrealized):
         return "DAILY LOSS LIMIT REACHED"
     in_window, stop_reached = check_schedule(app)
     if not in_window:
@@ -3374,7 +3370,7 @@ def _maybe_stop_after_exit(app: App, reason: str, pnl: float | None) -> None:
 
 
 def _block_for_daily_loss(app: App) -> None:
-    """Block new entries until the next IST midnight. Do not flatten the open trade."""
+    """Block new entries until the next IST midnight. The caller closes the open trade."""
     app.runtime.entries_blocked_reason = "DAILY LOSS LIMIT REACHED"
     if app.runtime.status not in {"STOPPED", "LONG", "SHORT", "EXITING"}:
         app.runtime.status = "SCANNING"
@@ -3413,19 +3409,21 @@ def manage_open_position(app: App, last_price: float, mark_price: float) -> None
         else calculate_position_pnl(pos, mark_price, product.contract_value)
     )
 
-    if daily_loss_limit_reached(app):
+    if app.cfg.trailing.enabled and check_take_profit(app, open_unrealized, mark_price):
+        pnl = close_strategy_position(app, "TP", last_price)
+        _maybe_stop_after_exit(app, "TP", pnl)
+        return
+
+    if daily_loss_limit_reached(app, open_unrealized):
         _block_for_daily_loss(app)
+        close_strategy_position(app, "DAILY LOSS", last_price)
+        return
 
     if app.cfg.trailing.enabled:
         if _advance_peak(app, open_unrealized):
             _write_day_ledger(app)
         edit_ok = _ratchet_exchange_stop(app)
         stop_unprotected = pos.sl_order_id is None or not edit_ok
-        tp_unprotected = pos.tp_order_id is None
-        if tp_unprotected and check_take_profit(app, open_unrealized, mark_price):
-            pnl = close_strategy_position(app, "TP", last_price)
-            _maybe_stop_after_exit(app, "TP", pnl)
-            return
         if stop_unprotected and check_stop_loss(app, open_unrealized, mark_price):
             pnl = close_strategy_position(app, "SL", last_price)
             _maybe_stop_after_exit(app, "SL", pnl)
