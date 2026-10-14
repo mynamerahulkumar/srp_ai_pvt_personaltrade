@@ -1351,6 +1351,41 @@ def _paginate_wallet_transactions(app: App, start_us: int, end_us: int) -> list[
     return rows
 
 
+def _epoch_to_us(value: float) -> int:
+    """Normalize a unix epoch in seconds, milliseconds, or microseconds."""
+    magnitude = abs(value)
+    if magnitude >= 100_000_000_000_000:
+        return int(value)
+    if magnitude >= 100_000_000_000:
+        return int(value * 1_000)
+    return int(value * 1_000_000)
+
+
+def _wallet_row_time_us(row: dict[str, Any]) -> int | None:
+    """Unix microseconds on a wallet row. None when the row has no timestamp."""
+    raw = row.get("created_at")
+    if raw is None:
+        raw = row.get("timestamp") if row.get("timestamp") is not None else row.get("time")
+    if raw is None or raw == "":
+        return None
+    if isinstance(raw, (int, float)):
+        return _epoch_to_us(float(raw))
+    text = str(raw).strip()
+    if not text:
+        return None
+    if text[0].isdigit() or (text[0] == "-" and len(text) > 1 and text[1].isdigit()):
+        numeric = _to_float(text)
+        if numeric is not None:
+            return _epoch_to_us(numeric)
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return int(parsed.timestamp() * 1_000_000)
+
+
 def _exchange_day_realized(app: App) -> float | None:
     """Sum IST-day wallet cashflow+commission+funding for this product. None on failure."""
     product = app.runtime.product
@@ -1376,6 +1411,9 @@ def _exchange_day_realized(app: App) -> float | None:
         if row_pid is None and row_sym and row_sym != symbol:
             continue
         if row_pid is None and not row_sym:
+            continue
+        row_us = _wallet_row_time_us(row)
+        if row_us is not None and row_us < start_us:
             continue
         amount = _to_float(row.get("amount"))
         if amount is None:
@@ -1493,20 +1531,38 @@ def _load_day_ledger(app: App) -> None:
     )
 
 
+def _drop_daily_loss_events(runtime: Runtime) -> None:
+    """Remove yesterday's loss-limit lines so the dashboard does not look blocked."""
+    runtime.events = deque(
+        (item for item in runtime.events if "DAILY LOSS LIMIT REACHED" not in item),
+        maxlen=runtime.events.maxlen,
+    )
+
+
 def refresh_trading_day(app: App) -> None:
     today = trading_day_now(app.cfg)
     if app.runtime.trading_day != today:
+        was_blocked = (
+            app.runtime.daily_loss_announced
+            or app.runtime.entries_blocked_reason == "DAILY LOSS LIMIT REACHED"
+            or any("DAILY LOSS LIMIT REACHED" in item for item in app.runtime.events)
+        )
         app.runtime.trading_day = today
         app.runtime.daily_realized_pnl = 0.0
         app.runtime.daily_orders = 0
         app.runtime.scheduled_close_done = False
         app.runtime.daily_loss_announced = False
         app.runtime.resume_after_candle_open = None
-        app.runtime.startup_breakout_checked = False
         app.runtime.booked_strategy_ids.clear()
         app.runtime.consumed_signal_ids.clear()
+        if app.runtime.entries_blocked_reason == "DAILY LOSS LIMIT REACHED":
+            app.runtime.entries_blocked_reason = None
+        if was_blocked:
+            _drop_daily_loss_events(app.runtime)
         _write_day_ledger(app)
         log_event(app.runtime, f"NEW IST TRADING DAY {today.isoformat()}")
+        if was_blocked:
+            log_event(app.runtime, "DAILY LOSS LIMIT CLEARED — ENTRIES RESUMED")
         _sync_daily_realized_from_exchange(app, force=True)
 
 
