@@ -27,7 +27,7 @@ polling_seconds: 1
 
 # Candle timeframe used by the breakout strategy
 # Examples: 1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d
-timeframe: "1h"
+timeframe: "4h"
 
 # ------------------------------------------------------------
 # RUNNING MODE
@@ -79,7 +79,7 @@ confirmation:
 
   # true  = wait for a completed candle close beyond the level
   # false = enter when the live price crosses the level
-  candle_close_confirmation: false
+  candle_close_confirmation: true
 
 # ------------------------------------------------------------
 # TP / SL
@@ -138,8 +138,9 @@ max_open_strategies: 1
 
 max_orders_per_day: 20
 
-# If today's realized plus open loss reaches this amount, close the open
-# trade and block new entries until the next Asia/Kolkata day.
+# If today's price PnL minus fees, plus the open trade, reaches this amount,
+# close the open trade and block new entries until the next Asia/Kolkata day.
+# A new trade is also refused when one more full stop would break this amount.
 # A +take_profit win closes that trade only and keeps scanning the same day.
 max_loss_per_day_dollar: 10
 

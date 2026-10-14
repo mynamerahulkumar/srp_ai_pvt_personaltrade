@@ -9,9 +9,9 @@ exchange:
 historical_data:
   symbols:
     - "BTCUSD"
-    - "ETHUSD"
-    - "SOLUSD"
-  interval: "1h"
-  days: 7
+    # - "ETHUSD"
+    # - "SOLUSD"
+  interval: "30m"
+  days: 30
   timezone: "Asia/Kolkata"
   output_directory: "data/historical"
