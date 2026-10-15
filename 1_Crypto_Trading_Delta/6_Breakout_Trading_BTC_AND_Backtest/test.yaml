@@ -1,0 +1,87 @@
+# Backtest inputs for the BTCUSD breakout comparison.
+# Paths are relative to this file.
+
+lookback_days: 150
+tune_days: 100
+contract_value: 0.001
+tick_size: 0.5
+fee_per_side_bps: 5
+target_daily_pnl: 6
+usd_inr: 84
+max_loss_per_day_inr: 600
+
+report: result_backtest.md
+config_to_update: config.yaml
+
+intervals:
+  - name: 1h
+    timeframe: "1h"
+    path: data/historical/BTCUSD_1h.csv
+  - name: 30m
+    timeframe: "30m"
+    path: data/historical/BTCUSD_30m.csv
+  - name: 15m
+    timeframe: "15m"
+    path: data/historical/BTCUSD_15m.csv
+
+# Current config.yaml settings. Run on every interval before the search.
+baseline:
+  breakout_lookback_candles: 1
+  direction: BOTH
+  confirmation_points: 150
+  candle_close_confirmation: false
+  take_profit: 5
+  stop_loss: 3
+  order_size: 5
+  max_orders_per_day: 20
+  max_loss_per_day_dollar: 10
+
+# Positive take-profit on the first 100 days is required.
+# The winner is the best average daily PnL on the remaining days.
+search:
+  breakout_lookback_candles: [1, 3, 6]
+  confirmation_points: [50, 150, 300]
+  take_profit: [6, 8, 12]
+  stop_loss: [3, 4, 6]
+  order_size: [5, 20]
+  candle_close_confirmation: [false, true]
+  direction: ["BOTH"]
+  max_orders_per_day: 20
+  max_loss_per_day_dollar: 10
+
+# Frozen 1h winner. CSV datetimes are Asia/Kolkata.
+# Fixed dollars keep TP $12 / SL $6. Scaled dollars keep the 2400 / 1200 point bracket.
+position_size:
+  signal:
+    interval: 1h
+    breakout_lookback_candles: 1
+    direction: BOTH
+    confirmation_points: 300
+    candle_close_confirmation: false
+    base_order_size: 5
+    base_take_profit: 12
+    base_stop_loss: 6
+    base_max_loss_per_day_dollar: 10
+    max_orders_per_day: 20
+  order_size: [1, 5, 10, 20, 50]
+  leverage: [20, 25, 50, 100, 200]
+  daily_profit_target_inr: 500
+  indicator_sizes: [5, 10, 20]
+  indicator_filters: [none, ema20, ema50, rsi14, bollinger]
+  candle_timezone: Asia/Kolkata
+  sessions:
+    - name: New York
+      timezone: America/New_York
+      start: "09:30"
+      stop: "16:00"
+      flatten_at_stop: true
+    - name: London
+      timezone: Europe/London
+      start: "08:00"
+      stop: "16:30"
+      flatten_at_stop: true
+    - name: Full day
+      timezone: Asia/Kolkata
+      start:
+      stop:
+      flatten_at_stop: false
