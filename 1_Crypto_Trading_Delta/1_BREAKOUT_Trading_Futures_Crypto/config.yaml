@@ -15,7 +15,7 @@ mode: "LIVE"
 leverage: 25
 
 # Number of contracts/orders for each entry
-order_size: 5
+order_size: 1
 
 # market_order is recommended for the simple default execution
 # limit_order can be implemented if fully supported
@@ -91,7 +91,7 @@ take_profit:
 
   # PNL = dollars
   # PERCENT = percentage from entry price
-  value: 5
+  value: 3
 
 stop_loss:
   enabled: true
@@ -100,8 +100,8 @@ stop_loss:
   mode: "PNL"
 
   # Positive dollar amount when mode = PNL
-  # Example 5 means exit around -$5
-  value: 3
+  # Example 1 means exit around -$1
+  value: 1
 
 # Stop after TP/SL exit
 stop_after_tp: false
@@ -126,7 +126,7 @@ max_orders_per_day: 20
 
 # If daily strategy loss reaches this amount,
 # block new entries and close active strategy position.
-max_loss_per_day_dollar: 10
+max_loss_per_day_dollar: 2
 
 # ------------------------------------------------------------
 # RE-ENTRY
