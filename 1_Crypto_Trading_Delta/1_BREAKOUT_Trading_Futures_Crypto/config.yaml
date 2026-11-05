@@ -59,7 +59,11 @@ strategy:
   # 1 = the previous completed candle (5m = previous 5m bar, 1d = previous day).
   breakout_lookback_candles: 1
 
-  # LONG, SHORT or BOTH
+  # BREAKOUT = buy a poke above the range, sell a poke below it
+  # FADE     = sell a poke above the range, buy a poke below it
+  entry: "FADE"
+
+  # LONG, SHORT or BOTH. Filters the order side, not the poked level.
   direction: "BOTH"
 
 # ------------------------------------------------------------
@@ -89,9 +93,9 @@ take_profit:
   # PNL or PERCENT
   mode: "PNL"
 
-  # PNL = dollars
+  # PNL = dollars of cash profit after the entry fee and the exit fee
   # PERCENT = percentage from entry price
-  value: 3
+  value: 1
 
 stop_loss:
   enabled: true
@@ -99,9 +103,9 @@ stop_loss:
   # PNL or PERCENT
   mode: "PNL"
 
-  # Positive dollar amount when mode = PNL
-  # Example 1 means exit around -$1
-  value: 1
+  # Positive cash loss after the entry fee and the exit fee when mode = PNL
+  # Example 2 means the trade loses about $2 including both fees
+  value: 2
 
 # Stop after TP/SL exit
 stop_after_tp: false
@@ -122,11 +126,17 @@ day_trading_enabled: true
 
 max_open_strategies: 1
 
-max_orders_per_day: 20
+max_orders_per_day: 2
 
 # If daily strategy loss reaches this amount,
 # block new entries and close active strategy position.
-max_loss_per_day_dollar: 2
+# This is exchange cash, so fees already count toward it.
+max_loss_per_day_dollar: 3
+
+# Fraction of order value charged on each fill.
+# The order log is 0.05% plus 18% GST, which is 0.00059.
+# A $1 target is placed far enough that both fills still leave about $1.
+fee_rate: 0.00059
 
 # ------------------------------------------------------------
 # RE-ENTRY

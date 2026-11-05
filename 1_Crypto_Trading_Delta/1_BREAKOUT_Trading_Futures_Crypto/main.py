@@ -221,6 +221,7 @@ class StrategyConfig:
     enabled: bool
     breakout_lookback_candles: int
     direction: str
+    entry: str
 
 
 @dataclass
@@ -249,6 +250,7 @@ class Config:
     max_orders_per_day: int
     max_loss_per_day_dollar: float
     allow_reentry_after_exit: bool
+    fee_rate: float
     tz: ZoneInfo = field(init=False)
 
     def __post_init__(self) -> None:
@@ -292,6 +294,7 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
             enabled=bool(strategy_raw.get("enabled", True)),
             breakout_lookback_candles=int(strategy_raw.get("breakout_lookback_candles", 20)),
             direction=str(strategy_raw.get("direction", "BOTH")).strip().upper(),
+            entry=str(strategy_raw.get("entry", "BREAKOUT")).strip().upper(),
         ),
         confirmation=ConfirmationConfig(
             enabled=bool(confirmation_raw.get("enabled", True)),
@@ -316,6 +319,7 @@ def load_config(path: Path = CONFIG_PATH) -> Config:
         max_orders_per_day=int(raw.get("max_orders_per_day", 10)),
         max_loss_per_day_dollar=float(raw.get("max_loss_per_day_dollar", 5)),
         allow_reentry_after_exit=bool(raw.get("allow_reentry_after_exit", False)),
+        fee_rate=float(raw.get("fee_rate", 0.00059)),
     )
     validate_config(cfg)
     return cfg
@@ -364,6 +368,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("breakout_lookback_candles must be >= 1")
     if cfg.strategy.direction not in {"LONG", "SHORT", "BOTH"}:
         raise ConfigError("strategy.direction must be LONG, SHORT or BOTH")
+    if cfg.strategy.entry not in {"BREAKOUT", "FADE"}:
+        raise ConfigError("strategy.entry must be BREAKOUT or FADE")
     if cfg.confirmation.mode not in {"POINTS", "PERCENT"}:
         raise ConfigError("confirmation.mode must be POINTS or PERCENT")
     if cfg.confirmation.value < 0:
@@ -376,6 +382,8 @@ def validate_config(cfg: Config) -> None:
         raise ConfigError("take_profit.value must be > 0")
     if cfg.stop_loss.value <= 0:
         raise ConfigError("stop_loss.value must be > 0")
+    if not 0 <= cfg.fee_rate < 0.05:
+        raise ConfigError("fee_rate must be from 0 up to but not including 0.05")
     if cfg.max_open_strategies < 1:
         raise ConfigError("max_open_strategies must be >= 1")
     if cfg.max_orders_per_day < 1:
@@ -1243,37 +1251,42 @@ def detect_breakout_signal(
             return None
         test_price = live_price
 
-    allowed = app.cfg.strategy.direction
-    symbol = app.runtime.product.symbol
-    tf = app.cfg.timeframe
-    long_hit = allowed in {"LONG", "BOTH"} and test_price > long_level
-    short_hit = allowed in {"SHORT", "BOTH"} and test_price < short_level
-    if long_hit and short_hit:
+    above = test_price > long_level
+    below = test_price < short_level
+    if above and below:
         app.runtime.entries_blocked_reason = "BREAKOUT SIDES OVERLAP"
         return None
-    if long_hit:
-        return BreakoutSignal(
-            direction="LONG",
-            range_high=range_high,
-            range_low=range_low,
-            breakout_level=long_level,
-            confirmation_price=test_price,
-            candle_timestamp=reference.time,
-            reason=f"Bullish breakout confirmed above {long_level}",
-            signal_id=_signal_id(symbol, tf, "LONG", range_high, range_low, reference.time),
-        )
-    if short_hit:
-        return BreakoutSignal(
-            direction="SHORT",
-            range_high=range_high,
-            range_low=range_low,
-            breakout_level=short_level,
-            confirmation_price=test_price,
-            candle_timestamp=reference.time,
-            reason=f"Bearish breakout confirmed below {short_level}",
-            signal_id=_signal_id(symbol, tf, "SHORT", range_high, range_low, reference.time),
-        )
-    return None
+    fade = app.cfg.strategy.entry == "FADE"
+    if above:
+        side = "SHORT" if fade else "LONG"
+        level = long_level
+    elif below:
+        side = "LONG" if fade else "SHORT"
+        level = short_level
+    else:
+        return None
+    if app.cfg.strategy.direction not in {"BOTH", side}:
+        return None
+    if fade and side == "SHORT":
+        reason = f"Fade short above {level}"
+    elif fade:
+        reason = f"Fade long below {level}"
+    elif side == "LONG":
+        reason = f"Bullish breakout confirmed above {level}"
+    else:
+        reason = f"Bearish breakout confirmed below {level}"
+    symbol = app.runtime.product.symbol
+    tf = app.cfg.timeframe
+    return BreakoutSignal(
+        direction=side,
+        range_high=range_high,
+        range_low=range_low,
+        breakout_level=level,
+        confirmation_price=test_price,
+        candle_timestamp=reference.time,
+        reason=reason,
+        signal_id=_signal_id(symbol, tf, side, range_high, range_low, reference.time),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1589,30 +1602,81 @@ def _book_realized_pnl(app: App, strategy_id: str, pnl: float) -> bool:
 # ---------------------------------------------------------------------------
 
 
+def _round_trip_price_move(
+    entry_price: float,
+    quantity: int,
+    contract_value: float,
+    net_dollars: float,
+    fee_rate: float,
+    direction: str,
+    profit: bool,
+) -> float:
+    """Price move that leaves net_dollars after the entry fee and the exit fee.
+
+    net_dollars is a profit when profit is True, and a positive loss otherwise.
+    A zero fee rate returns the plain dollar-to-points move.
+    """
+    qty_cv = quantity * contract_value
+    if qty_cv <= 0 or entry_price <= 0:
+        return 0.0
+    rate = min(max(fee_rate, 0.0), 0.049)
+    cash_points = net_dollars / qty_cv
+    fee_points = 2.0 * rate * entry_price
+    numer = cash_points + fee_points if profit else cash_points - fee_points
+    denom = (1.0 - rate) if direction == "LONG" else (1.0 + rate)
+    if denom <= 0 or numer <= 0:
+        return cash_points
+    return numer / denom
+
+
+def _gross_pnl_dollars(app: App, net_dollars: float, profit: bool) -> float:
+    """Price PnL that nets net_dollars once both fills have been charged."""
+    pos = app.runtime.position
+    product = app.runtime.product
+    if pos is None or product is None:
+        return net_dollars
+    move = _round_trip_price_move(
+        pos.entry_price,
+        pos.quantity,
+        product.contract_value,
+        net_dollars,
+        app.cfg.fee_rate,
+        pos.direction,
+        profit,
+    )
+    return move * pos.quantity * product.contract_value
+
+
 def calculate_take_profit(app: App) -> tuple[float | None, float | None]:
     """Return (tp_pnl_target, tp_price) according to config.
 
-    PNL mode uses a dollar target. PERCENT uses an entry-price target.
+    PNL mode uses a dollar target. That target is the cash profit after both
+    fees, so the returned price PnL is a little larger. PERCENT uses an
+    entry-price target and does not add fees.
     """
     pos = app.runtime.position
     tp = app.cfg.take_profit
     if pos is None or not tp.enabled:
         return None, None
     if tp.mode == "PNL":
-        return tp.value, None
+        return _gross_pnl_dollars(app, tp.value, profit=True), None
     if pos.direction == "LONG":
         return None, pos.entry_price * (1 + tp.value / 100.0)
     return None, pos.entry_price * (1 - tp.value / 100.0)
 
 
 def calculate_stop_loss(app: App) -> tuple[float | None, float | None]:
-    """Return (sl_pnl_abs, sl_price). sl_pnl_abs is a positive dollar amount."""
+    """Return (sl_pnl_abs, sl_price). sl_pnl_abs is a positive price-PnL amount.
+
+    In PNL mode the config value is the cash loss after both fees, so the
+    price move that triggers the stop is a little smaller than that value.
+    """
     pos = app.runtime.position
     sl = app.cfg.stop_loss
     if pos is None or not sl.enabled:
         return None, None
     if sl.mode == "PNL":
-        return sl.value, None
+        return _gross_pnl_dollars(app, sl.value, profit=False), None
     if pos.direction == "LONG":
         return None, pos.entry_price * (1 - sl.value / 100.0)
     return None, pos.entry_price * (1 + sl.value / 100.0)
@@ -1642,8 +1706,9 @@ def _price_str(price: float, tick_size: Decimal) -> str:
 def exit_limit_prices(app: App, direction: str, entry_price: float, quantity: int) -> tuple[float | None, float | None]:
     """Take-profit and stop-loss prices from the fill and config.
 
-    PNL converts the dollar target into points with quantity and contract value.
-    PERCENT moves the entry price by the configured percent.
+    PNL converts the net dollar target into points with quantity, contract
+    value, and the entry plus exit fee. PERCENT moves the entry price by the
+    configured percent and does not add fees.
     """
     product = app.runtime.product
     if product is None or quantity <= 0:
@@ -1652,7 +1717,15 @@ def exit_limit_prices(app: App, direction: str, entry_price: float, quantity: in
     contract_value = product.contract_value
 
     def _from_pnl(dollars: float, profit: bool) -> float:
-        move = dollars / (quantity * contract_value)
+        move = _round_trip_price_move(
+            entry_price,
+            quantity,
+            contract_value,
+            dollars,
+            app.cfg.fee_rate,
+            direction,
+            profit,
+        )
         if direction == "LONG":
             return entry_price + move if profit else entry_price - move
         return entry_price - move if profit else entry_price + move
@@ -2406,11 +2479,18 @@ def _waiting_for(app: App, digits: int) -> str:
     if pos is not None:
         return f"IN {pos.direction}"
     direction = app.cfg.strategy.direction
+    fade = app.cfg.strategy.entry == "FADE"
     parts: list[str] = []
-    if direction in {"LONG", "BOTH"} and rt.long_level is not None:
-        parts.append(f"LONG above {_px(rt.long_level, digits)}")
-    if direction in {"SHORT", "BOTH"} and rt.short_level is not None:
-        parts.append(f"SHORT below {_px(rt.short_level, digits)}")
+    if fade:
+        if direction in {"SHORT", "BOTH"} and rt.long_level is not None:
+            parts.append(f"SHORT above {_px(rt.long_level, digits)}")
+        if direction in {"LONG", "BOTH"} and rt.short_level is not None:
+            parts.append(f"LONG below {_px(rt.short_level, digits)}")
+    else:
+        if direction in {"LONG", "BOTH"} and rt.long_level is not None:
+            parts.append(f"LONG above {_px(rt.long_level, digits)}")
+        if direction in {"SHORT", "BOTH"} and rt.short_level is not None:
+            parts.append(f"SHORT below {_px(rt.short_level, digits)}")
     if not parts:
         return "WAITING FOR BREAKOUT RANGE"
     return "WAITING FOR " + " or ".join(parts)
